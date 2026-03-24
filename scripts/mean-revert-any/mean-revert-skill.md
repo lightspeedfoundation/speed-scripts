@@ -1,3 +1,16 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+Spend/quote amounts (e.g. `-Amount`, `-TotalAmount`, `-BasePerGrid`, `-BasePerRung`) are in **units of the base token**. Use `../scripts/` if you want ETH-only bots unchanged.
+
+---
+
 # Mean-Reversion Buy Skill
 
 Complete reference for `mean-revert-any.ps1` and `mean-revert-any.sh` — mean-reversion entry bots built on the `speed` CLI.
@@ -37,7 +50,7 @@ Mean reversion is the philosophical opposite of momentum trading. Where `momentu
 
 **Key difference from `momentum-any`:** Entry condition is inverted. Momentum buys new highs; mean-revert buys dips. They can run simultaneously on the same token to cover both market regimes.
 
-**If no dip occurs:** The script exits cleanly at `MaxIterations` without having spent any ETH.
+**If no dip occurs:** The script exits cleanly at `MaxIterations` without having spent any base token.
 
 ---
 
@@ -46,14 +59,16 @@ Mean reversion is the philosophical opposite of momentum trading. Where `momentu
 | Parameter (PS1)   | Flag (SH)          | Type    | Default  | Description |
 |---|---|---|---|---|
 | `-Chain`          | `--chain`          | string  | required | Chain name or ID (`base`, `ethereum`, `arbitrum`, etc.) |
-| `-Token`          | `--token`          | string  | required | Token contract address or alias (`speed`). ETH is always the quote currency. |
-| `-Amount`         | `--amount`         | string  | required | ETH to spend when a dip is confirmed. |
+| `-Token`          | `--token`          | string  | required | Token contract address or alias (`speed`, `cbBTC`, …). |
+| `-Amount`         | `--amount`         | string  | required | **Base token** to spend when a dip is confirmed. |
+| `-BaseToken`      | `--base-token`     | string  | `speed`  | Quote asset for pricing and swaps (`speed`, `eth`, …). |
+| `-BaseTokenSymbol`| `--base-token-symbol` | string | *(empty)* | Display label for base in logs. |
 | `-WindowPolls`    | `--window-polls`   | integer | `20`     | Number of polls in the rolling SMA window. Also controls warm-up length. |
 | `-DipPct`         | `--dip-pct`        | float   | `3`      | % below rolling mean required to confirm a dip entry. |
 | `-RecoverPct`     | `--recover-pct`    | float   | `1`      | Mean-recovery exit: sell when price >= mean × (1 − RecoverPct/100). `0` = sell at mean. Negative = sell above mean. Only used when `TrailPct = 0`. |
 | `-StopPct`        | `--stop-pct`       | float   | `10`     | Hard stop-loss: % below entry price that triggers an immediate sell. Always active regardless of exit mode. |
 | `-TrailPct`       | `--trail-pct`      | float   | `0`      | If > 0: use a trailing stop post-entry instead of mean-recovery. |
-| `-TokenSymbol`    | `--tokensymbol`    | string  | address  | Display label for the token in output. |
+| `-TokenSymbol`    | `--tokensymbol`    | string  | `""`     | Optional display label for the token. |
 | `-PollSeconds`    | `--pollseconds`    | integer | `60`     | Seconds between price polls. |
 | `-MaxIterations`  | `--maxiterations`  | integer | `1440`   | Max total polls (watch + hold). If no dip by this limit, exits without trading. |
 | `-DryRun`         | `--dry-run`        | switch  | off      | Log dip signals without buying. |
@@ -64,9 +79,9 @@ Mean reversion is the philosophical opposite of momentum trading. Where `momentu
 
 ### Price oracle
 
-Price is measured as: **ETH returned for a fixed reference token amount** (`refTokenStr`).
+Price is measured as: **base token returned for a fixed reference token amount** (`refTokenStr`).
 
-`refTokenStr` is determined once at startup by quoting `Amount` ETH → Token. The same amount is used throughout all phases. A higher ETH return = higher price.
+`refTokenStr` is determined once at startup by quoting `Amount` **BaseToken** → Token. The same reference size is used throughout all phases. A higher base return = higher price.
 
 ### Rolling window (SMA)
 
@@ -116,10 +131,10 @@ Gross gain = (0.99 − 0.97) / 0.97 ≈ +2.06%
 After the dip buy executes:
 
 ```
-peakRaw  = quote(refTokenStr → ETH) immediately after buy
+peakRaw  = quote(refTokenStr → BaseToken) immediately after buy
 floorRaw = peakRaw × (1 − TrailPct / 100)
 
-Each poll: re-quote refTokenStr → ETH
+Each poll: re-quote refTokenStr → BaseToken
   If currentRaw > peakRaw: peak and floor rise
   If currentRaw ≤ floorRaw: sell immediately
 ```
@@ -134,7 +149,7 @@ stopThresh = entryRaw × (1 − StopPct / 100)
 Sell fires when: currentPrice <= stopThresh
 ```
 
-`entryRaw` is the ETH sell-back value for `refTokenStr` at the moment of entry (immediately after the buy). The stop is anchored to entry value, not the rolling mean. This protects against trending-down markets where mean reversion fails — without a hard stop, a mean-reversion bot will keep holding a position that never recovers.
+`entryRaw` is the base-token sell-back value for `refTokenStr` at the moment of entry (immediately after the buy). The stop is anchored to entry value, not the rolling mean. This protects against trending-down markets where mean reversion fails — without a hard stop, a mean-reversion bot will keep holding a position that never recovers.
 
 ### Warm-up phase
 
@@ -161,11 +176,11 @@ Phase 2 — Monitoring
   Dip detected → Phase 3
 
 Phase 3 — Entry
-  Execute: speed swap -c Chain --sell eth --buy Token -a Amount -y
+  Execute: speed swap -c Chain --sell BaseToken --buy Token -a Amount -y
   Quote post-buy price to anchor entryRaw, stopThresh, trail peak (if enabled)
 
 Phase 4 — Exit management (mean-recovery OR trailing stop + hard stop)
-  Each poll: re-quote refTokenStr → ETH
+  Each poll: re-quote refTokenStr → BaseToken
   Hard stop check first (always): sell if below entryRaw × (1 - StopPct/100)
   Mean-recovery: sell if above rollingMean × (1 − RecoverPct/100)
   Trailing stop: update peak/floor, sell if below floor
@@ -233,35 +248,37 @@ chmod +x mean-revert-any.sh
 
 ## 6. Reading the Output
 
+Example magnitudes match **Base mainnet**, **`-Amount 1000` speed**, **`cbBTC`**, **`refTokenStr` ≈ 0.00000333 cbBTC** — oracle = **cbBTC → speed** (~**10³ speed**), not ETH-scale fractions. See `../LIVE-TEST-1000-SPEED.md`.
+
 ### Warm-up phase
 
 ```
 [09:00:01] Warm-up 1/19 - waiting 60 s...
-[09:01:01] Price: 0.00041200 ETH  mean: 0.00041800  (dip: +1.44%)  [2 samples]
+[09:01:01] Price: 992.50 speed  mean: 995.00 speed  (dip: +0.25%)  [2 samples]
 [09:02:01] Warm-up 2/19 - waiting 60 s...
-[09:02:31] Price: 0.00041500 ETH  mean: 0.00041633  (dip: +0.32%)  [3 samples]
+[09:02:31] Price: 994.20 speed  mean: 996.20 speed  (dip: +0.20%)  [3 samples]
 ...
-Warm-up complete. Rolling mean: 0.00042500 ETH  (20 polls)
-Dip entry threshold : 0.00041225 ETH  (mean - 3%)
+Warm-up complete. Rolling mean: 1000.50 speed  (20 polls)
+Dip entry threshold : 970.48500 speed  (mean - 3%)
 ```
 
 ### Monitoring phase (pre-entry)
 
 ```
 [09:20:01] Poll 1 / 1440 - waiting 60 s...
-[09:21:01] Price: 0.00042100 ETH  mean: 0.00042500  dip: -0.9412%  trigger: 3.00%  (thresh: +2.13% away)
+[09:21:01] Price: 990.80 speed  mean: 1000.20  dip: +0.9400%  trigger: 3.00%  (thresh: +2.12% away)
 [09:22:01] Poll 2 / 1440 - waiting 60 s...
-[09:22:31] Price: 0.00041600 ETH  mean: 0.00042480  dip: +2.0750%  trigger: 3.00%  (thresh: +0.96% away)
-[09:24:01] Price: 0.00041100 ETH  mean: 0.00042400  dip: +3.0660%  trigger: 3.00%  (thresh: -0.02% away)
+[09:22:31] Price: 978.40 speed  mean: 998.60  dip: +2.0230%  trigger: 3.00%  (thresh: +1.01% away)
+[09:24:01] Price: 968.50 speed  mean: 997.80  dip: +2.9360%  trigger: 3.00%  (thresh: +0.09% away)
 
-DIP detected! Price 0.00041100 ETH <= threshold 0.00041128 ETH  (3.0660% below mean)
+DIP detected! Price 968.20 speed <= threshold 968.50 speed  (3.05% below mean)
 ```
 
 **Field meanings (pre-entry):**
 
 | Field | Description |
 |---|---|
-| `Price` | Current price in ETH |
+| `Price` | Current price in **base token** (label from `-BaseToken`, e.g. `speed`) |
 | `mean` | Current rolling SMA |
 | `dip: +X%` | Price is X% below the mean (positive = below mean) |
 | `dip: -X%` | Price is X% above the mean (above mean, not dipping) |
@@ -276,19 +293,19 @@ DIP detected! Price 0.00041100 ETH <= threshold 0.00041128 ETH  (3.0660% below m
 ### Post-entry: mean-recovery mode
 
 ```
-[09:35:01] POST-ENTRY  recov: 0.00041200 ETH  mean: 0.00042460  target: 0.00042035  (-2.0284% vs target)  stop<0.00036990
-[09:36:01] POST-ENTRY  recov: 0.00041700 ETH  mean: 0.00042500  target: 0.00042075  (-0.8930% vs target)  stop<0.00036990
-[09:37:01] POST-ENTRY  recov: 0.00042100 ETH  mean: 0.00042500  target: 0.00042075  (+0.0594% vs target)  stop<0.00036990
+[09:35:01] POST-ENTRY  recov: 962.00 speed  mean: 990.00  target: 980.10  (-1.85% vs target)  stop<871.80
+[09:36:01] POST-ENTRY  recov: 976.50 speed  mean: 992.00  target: 982.08  (-0.57% vs target)  stop<871.80
+[09:37:01] POST-ENTRY  recov: 983.20 speed  mean: 995.00  target: 985.05  (+0.18% vs target)  stop<871.80
 
-Recovery target reached! 0.00042100 ETH back  (+2.44% vs entry cost)
->>> speed swap -c base --sell speed --buy eth -a 98000.00 -y
+Recovery target reached! 985.40 speed back  (+2.5% vs entry cost)
+>>> speed swap -c base --sell <Token> --buy <BaseToken> -a <tokenAmt> -y
 ```
 
 **Field meanings (post-entry, mean-recovery):**
 
 | Field | Description |
 |---|---|
-| `recov` | Current ETH return for the held position |
+| `recov` | Current base-token return for the held position |
 | `mean` | Current rolling mean (updates each poll) |
 | `target` | Recovery target = mean × (1 − RecoverPct/100) |
 | `% vs target` | How far current price is from target (positive = above = near exit) |
@@ -300,9 +317,9 @@ Recovery target reached! 0.00042100 ETH back  (+2.44% vs entry cost)
 ### Post-entry: trailing stop mode
 
 ```
-[09:35:01] POST-ENTRY  trail: 0.00041200 ETH  peak: 0.00041200  floor: 0.00039964  (+0.0000% from peak)  stop<0.00036990
-[09:36:01] POST-ENTRY  trail: 0.00042100 ETH  peak: 0.00042100  floor: 0.00040837  (+0.0000% from peak)  stop<0.00036990
-[09:37:01] POST-ENTRY  trail: 0.00041950 ETH  peak: 0.00042100  floor: 0.00040837  (-0.3562% from peak)  stop<0.00036990
+[09:35:01] POST-ENTRY  trail: 970.00 speed  peak: 970.00  floor: 921.50  (+0.0000% from peak)  stop<871.50
+[09:36:01] POST-ENTRY  trail: 1005.00 speed  peak: 1005.00  floor: 954.75  (+0.0000% from peak)  stop<871.50
+[09:37:01] POST-ENTRY  trail: 948.00 speed  peak: 1005.00  floor: 954.75  (-5.67% from peak)  stop<871.50
 
 Trail floor breached! ...
 ```
@@ -313,13 +330,13 @@ Same field meanings as `momentum-any` post-entry trailing stop.
 
 ## 7. P/L Interpretation
 
-**Entry cost:** `Amount` ETH
+**Entry cost:** `Amount` in **base token**
 
-**Exit value:** ETH received from sell
+**Exit value:** Base token received from sell
 
 **Net P/L:**
 ```
-P/L % = (ethReceived − Amount) / Amount × 100
+P/L % = (baseReceived − Amount) / Amount × 100
 ```
 
 **Theoretical gross profit range** (before fees, assuming exact mean reversion):
@@ -347,7 +364,7 @@ Swap fees are approximately 0.1–0.15% per leg (0x + gas). Round-trip ≈ 0.2�
 | Warm-up time is long | 20 polls at 60 s each = 19 minutes before any entry is possible. | Reduce `WindowPolls` or `PollSeconds`. Trade-off: less stable mean, more false signals. |
 | RecoverPct = 0 may never fire | If the mean is drifting downward during recovery, the target (mean × 1.00) may keep moving out of reach. | Use `RecoverPct = 1` (default) to sell at 99% of mean, which is easier to reach, or use `TrailPct` instead. |
 | Dry-run shows repeated dip signals | In dry-run, no buy is executed, so if price stays below the threshold, a dip signal prints every poll. | Expected behaviour. Dry-run is for calibration only. |
-| `refTokenStr` mismatch after entry | The trailing stop and mean-recovery both quote `refTokenStr → ETH`. This was computed at startup. After a large price move, the actual tokens received from the buy may differ slightly. | Consistent with `momentum-any`. The sell executes `refTokenStr` as the sell amount. Tiny amounts may remain unsold if actual received was higher. |
+| `refTokenStr` mismatch after entry | The trailing stop and mean-recovery both quote `refTokenStr → BaseToken`. This was computed at startup. After a large price move, the actual tokens received from the buy may differ slightly. | Consistent with `momentum-any`. The sell executes `refTokenStr` as the sell amount. Tiny amounts may remain unsold if actual received was higher. |
 | Low-liquidity tokens | On thin orderbooks, quotes can vary significantly between polls, causing false dip signals or premature exits. | Use wider `DipPct` and `StopPct` for low-liquidity tokens. |
 
 ---

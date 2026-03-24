@@ -2,16 +2,16 @@
 .SYNOPSIS
     Mean-reversion buy: build a rolling price mean and only buy when price dips
     -DipPct% below it. Exits when price recovers back toward the mean or at a
-    hard stop-loss. Never spends ETH unless a confirmed dip occurs.
+    hard stop-loss. Never spends base unless a confirmed dip occurs.
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes -Amount ETH -> <Token> to derive a reference amount (no buy yet).
-    3. Quotes that reference amount -> ETH to establish an initial price.
+    2. Quotes -Amount of -BaseToken -> <Token> to derive a reference amount (no buy yet).
+    3. Quotes that reference amount -> BaseToken to establish an initial price.
     4. Warm-up phase: polls -WindowPolls times to build the rolling price window.
     5. Detection phase: each poll updates the rolling window and computes the SMA.
        Dip condition: currentPrice <= rollingMean * (1 - DipPct/100)
-    6. On dip confirmed: executes the buy (-Amount ETH -> Token).
+    6. On dip confirmed: executes the buy (-Amount BaseToken -> Token).
     7. Post-buy exits (hard stop always active):
        a. Mean-recovery (default): sell when price >= rollingMean * (1 - RecoverPct/100).
           The mean keeps updating during the hold — target follows the market.
@@ -29,10 +29,10 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    Amounts and P/L are in -BaseToken (default: speed).
 
 .PARAMETER Amount
-    ETH to spend when a dip is confirmed.
+    Amount of -BaseToken to spend when a dip is confirmed.
 
 .PARAMETER WindowPolls
     Number of recent polls used to compute the rolling mean (SMA).
@@ -89,13 +89,15 @@ param(
     [int]     $PollSeconds      = 60,
     [int]     $MaxIterations    = 1440,
     [int]     $TimeStopMinutes  = 0,
-    [switch]  $DryRun
+    [switch]  $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -157,8 +159,8 @@ function Get-Quote {
 function Run-Sell {
     param([string]$tokenAmount)
     Write-Host ""
-    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y" -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
     exit $LASTEXITCODE
 }
 
@@ -169,6 +171,12 @@ Write-Host "Detecting token decimals..." -ForegroundColor DarkGray
 $tokenDecimals = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
 $TOKEN_SCALE   = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel    = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
+
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
 
 if ($WindowPolls -lt 2)      { Write-Error "-WindowPolls must be >= 2."; exit 1 }
 if ($DipPct -le 0)           { Write-Error "-DipPct must be > 0."; exit 1 }
@@ -187,7 +195,7 @@ Write-Host "=== Speed Mean-Reversion Buy ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- dip signals logged, no buy will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain          : $Chain"
 Write-Host "  Token          : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  Buy amount     : $Amount ETH  (on dip)"
+Write-Host "  Buy amount     : $Amount $($script:BaseLabel)  (on dip)"
 Write-Host "  Window polls   : $WindowPolls  (rolling SMA)"
 Write-Host "  Dip trigger    : $DipPct % below rolling mean"
 Write-Host "  Exit mode      : $exitMode"
@@ -201,9 +209,9 @@ Write-Host ""
 
 # -- step 1: reference quote (no buy yet) --------------------------------------
 
-Write-Host "Step 1 - Quoting $Amount ETH -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $Amount $($script:BaseLabel) -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
 
-$refBuyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
+$refBuyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
 $refTokenRaw   = [double]$refBuyQuote.buyAmount
 $refTokenHuman = $refTokenRaw / $TOKEN_SCALE
 $refTokenStr   = $refTokenHuman.ToString("F$tokenDecimals")
@@ -212,18 +220,18 @@ if ([double]$refTokenStr -le 0) {
     Write-Error "Reference token amount resolved to 0 (raw=$refTokenRaw, decimals=$tokenDecimals). Aborting."
     exit 1
 }
-Write-Host ("  Reference amount : {0} {1} for {2} ETH" -f $refTokenStr, $TokenLabel, $Amount)
+Write-Host ("  Reference amount : {0} {1} for {2} {3}" -f $refTokenStr, $TokenLabel, $Amount, $script:BaseLabel)
 
 # -- step 2: initial price observation -----------------------------------------
 
 Write-Host ""
 Write-Host "Step 2 - Getting initial price..." -ForegroundColor DarkCyan
 
-$initSellQuote = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+$initSellQuote = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
 $initRaw       = [double]$initSellQuote.buyAmount
-$initETH       = $initRaw / $ETH_DECIMALS
+$initETH       = $initRaw / $script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Initial price : {0:F8} ETH  (for {1} {2})" -f $initETH, $refTokenStr, $TokenLabel)
+Write-Host ("  Initial price : {0:F8} {3}  (for {1} {2})" -f $initETH, $refTokenStr, $TokenLabel, $script:BaseLabel)
 Write-Host ""
 
 # -- step 3: warm-up phase — build initial window ------------------------------
@@ -243,15 +251,15 @@ while ($warmupDone -lt $warmupNeeded) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $wq       = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $wq       = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $wRaw     = [double]$wq.buyAmount
-        $wETH     = $wRaw / $ETH_DECIMALS
+        $wETH     = $wRaw / $script:BASE_DECIMALS_SCALE
         $wMean    = ($window | Measure-Object -Average).Average
-        $wMeanETH = $wMean / $ETH_DECIMALS
+        $wMeanETH = $wMean / $script:BASE_DECIMALS_SCALE
         $wDipPct  = if ($wMean -gt 0) { (($wMean - $wRaw) / $wMean) * 100.0 } else { 0.0 }
         $ts2      = Get-Date -Format "HH:mm:ss"
-        Write-Host ("[$ts2] Price: {0:F8} ETH  mean: {1:F8}  (dip: {2:+0.2f}%)  [{3} samples]" -f `
-            $wETH, $wMeanETH, $wDipPct, ($window.Count + 1)) -ForegroundColor DarkGray
+        Write-Host ("[$ts2] Price: {0:F8} {4}  mean: {1:F8} {4}  (dip: {2:F2}%)  [{3} samples]" -f `
+            $wETH, $wMeanETH, $wDipPct, ($window.Count + 1), $script:BaseLabel) -ForegroundColor DarkGray
         $window.Enqueue($wRaw)
         if ($window.Count -gt $WindowPolls) { [void]$window.Dequeue() }
     } catch {
@@ -262,13 +270,13 @@ while ($warmupDone -lt $warmupNeeded) {
 }
 
 $rollingMean    = ($window | Measure-Object -Average).Average
-$rollingMeanETH = $rollingMean / $ETH_DECIMALS
+$rollingMeanETH = $rollingMean / $script:BASE_DECIMALS_SCALE
 $dipThreshRaw   = $rollingMean * (1.0 - $DipPct / 100.0)
-$dipThreshETH   = $dipThreshRaw / $ETH_DECIMALS
+$dipThreshETH   = $dipThreshRaw / $script:BASE_DECIMALS_SCALE
 
 Write-Host ""
-Write-Host ("Warm-up complete. Rolling mean: {0:F8} ETH  ({1} polls)" -f $rollingMeanETH, $WindowPolls) -ForegroundColor DarkCyan
-Write-Host ("Dip entry threshold : {0:F8} ETH  (mean - {1}%)" -f $dipThreshETH, $DipPct) -ForegroundColor DarkCyan
+Write-Host ("Warm-up complete. Rolling mean: {0:F8} {2}  ({1} polls)" -f $rollingMeanETH, $WindowPolls, $script:BaseLabel) -ForegroundColor DarkCyan
+Write-Host ("Dip entry threshold : {0:F8} {2}  (mean - {1}%)" -f $dipThreshETH, $DipPct, $script:BaseLabel) -ForegroundColor DarkCyan
 Write-Host ""
 
 # -- step 4: monitoring + dip detection / post-entry exit ----------------------
@@ -278,6 +286,7 @@ Write-Host ""
 
 $iteration     = 0
 $entryMade     = $false
+$dryRunDipSeen = $false
 $tokenStr      = ""
 $entryRaw      = [double]0
 $stopThreshRaw = [double]0
@@ -308,37 +317,37 @@ while ($iteration -lt $MaxIterations) {
     }
 
     try {
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $currentETH = $currentRaw / $script:BASE_DECIMALS_SCALE
         $ts2        = Get-Date -Format "HH:mm:ss"
 
         # Update rolling window and recompute mean
         $window.Enqueue($currentRaw)
         if ($window.Count -gt $WindowPolls) { [void]$window.Dequeue() }
         $rollingMean    = ($window | Measure-Object -Average).Average
-        $rollingMeanETH = $rollingMean / $ETH_DECIMALS
+        $rollingMeanETH = $rollingMean / $script:BASE_DECIMALS_SCALE
         $dipThreshRaw   = $rollingMean * (1.0 - $DipPct / 100.0)
 
         # ── post-entry: exit management ────────────────────────────────────────
         if ($entryMade) {
-            $tq   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+            $tq   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
             $tRaw = [double]$tq.buyAmount
-            $tETH = $tRaw / $ETH_DECIMALS
+            $tETH = $tRaw / $script:BASE_DECIMALS_SCALE
 
             # Hard stop — checked before both exit modes
             if ($tRaw -le $stopThreshRaw) {
                 $lossPct = (($tETH - [double]$Amount) / [double]$Amount) * 100.0
                 Write-Host ""
-                Write-Host ("HARD STOP triggered! {0:F8} ETH back  ({1:F4}% vs entry cost)" -f $tETH, $lossPct) -ForegroundColor Red
+                Write-Host ("HARD STOP triggered! {0:F8} {2} back  ({1:F4}% vs entry cost)" -f $tETH, $lossPct, $script:BaseLabel) -ForegroundColor Red
                 if ($DryRun) {
-                    Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> ETH now." -ForegroundColor DarkYellow
+                    Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> $($script:BaseLabel) now." -ForegroundColor DarkYellow
                     exit 0
                 }
                 Run-Sell $tokenStr
             }
 
-            $stopThreshETH = $stopThreshRaw / $ETH_DECIMALS
+            $stopThreshETH = $stopThreshRaw / $script:BASE_DECIMALS_SCALE
 
             if ($TrailPct -gt 0) {
                 # ── trailing stop exit ─────────────────────────────────────────
@@ -346,8 +355,8 @@ while ($iteration -lt $MaxIterations) {
                     $peakRaw  = $tRaw
                     $floorRaw = $peakRaw * (1.0 - $TrailPct / 100.0)
                 }
-                $peakETH     = $peakRaw / $ETH_DECIMALS
-                $floorETH    = $floorRaw / $ETH_DECIMALS
+                $peakETH     = $peakRaw / $script:BASE_DECIMALS_SCALE
+                $floorETH    = $floorRaw / $script:BASE_DECIMALS_SCALE
                 $pctFromPeak = (($tRaw - $peakRaw) / $peakRaw) * 100.0
 
                 $trailDist   = $peakRaw - $floorRaw
@@ -360,20 +369,20 @@ while ($iteration -lt $MaxIterations) {
                     $color = "White"
                 }
 
-                Write-Host ("[$ts2] POST-ENTRY  trail: {0:F8} ETH  peak: {1:F8}  floor: {2:F8}  ({3:F4}% from peak)  stop<{4:F8}" -f `
-                    $tETH, $peakETH, $floorETH, $pctFromPeak, $stopThreshETH) -ForegroundColor $color
+                Write-Host ("[$ts2] POST-ENTRY  trail: {0:F8} {5}  peak: {1:F8} {5}  floor: {2:F8} {5}  ({3:F4}% from peak)  stop<{4:F8} {5}" -f `
+                    $tETH, $peakETH, $floorETH, $pctFromPeak, $stopThreshETH, $script:BaseLabel) -ForegroundColor $color
 
                 if ($tRaw -le $floorRaw) {
                     $gainPct = (($tETH - [double]$Amount) / [double]$Amount) * 100.0
                     Write-Host ""
-                    Write-Host ("Trail floor breached! {0:F8} ETH back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct) -ForegroundColor Red
+                    Write-Host ("Trail floor breached! {0:F8} {2} back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct, $script:BaseLabel) -ForegroundColor Red
                     Run-Sell $tokenStr
                 }
 
             } else {
                 # ── mean-recovery exit ─────────────────────────────────────────
                 $recoveryTargetRaw = $rollingMean * (1.0 - $RecoverPct / 100.0)
-                $recoveryTargetETH = $recoveryTargetRaw / $ETH_DECIMALS
+                $recoveryTargetETH = $recoveryTargetRaw / $script:BASE_DECIMALS_SCALE
                 $pctVsTarget       = (($tRaw - $recoveryTargetRaw) / $recoveryTargetRaw) * 100.0
 
                 if ($tRaw -ge $recoveryTargetRaw) {
@@ -384,13 +393,13 @@ while ($iteration -lt $MaxIterations) {
                     $color = "White"
                 }
 
-                Write-Host ("[$ts2] POST-ENTRY  recov: {0:F8} ETH  mean: {1:F8}  target: {2:F8}  ({3:+0.4f}% vs target)  stop<{4:F8}" -f `
-                    $tETH, $rollingMeanETH, $recoveryTargetETH, $pctVsTarget, $stopThreshETH) -ForegroundColor $color
+                Write-Host ("[$ts2] POST-ENTRY  recov: {0:F8} {5}  mean: {1:F8} {5}  target: {2:F8} {5}  ({3:F4}% vs target)  stop<{4:F8} {5}" -f `
+                    $tETH, $rollingMeanETH, $recoveryTargetETH, $pctVsTarget, $stopThreshETH, $script:BaseLabel) -ForegroundColor $color
 
                 if ($tRaw -ge $recoveryTargetRaw) {
                     $gainPct = (($tETH - [double]$Amount) / [double]$Amount) * 100.0
                     Write-Host ""
-                    Write-Host ("Recovery target reached! {0:F8} ETH back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct) -ForegroundColor Green
+                    Write-Host ("Recovery target reached! {0:F8} {2} back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct, $script:BaseLabel) -ForegroundColor Green
                     Run-Sell $tokenStr
                 }
             }
@@ -400,7 +409,7 @@ while ($iteration -lt $MaxIterations) {
 
         # ── pre-entry: watch for dip ───────────────────────────────────────────
         $dipPctCurrent = if ($rollingMean -gt 0) { (($rollingMean - $currentRaw) / $rollingMean) * 100.0 } else { 0.0 }
-        $pctVsThresh   = (($currentRaw - $dipThreshRaw) / $dipThreshRaw) * 100.0
+        $dipNeeded     = [Math]::Max(0.0, $DipPct - $dipPctCurrent)
 
         if ($dipPctCurrent -ge $DipPct) {
             $color = "Green"
@@ -412,46 +421,50 @@ while ($iteration -lt $MaxIterations) {
             $color = "DarkGray"
         }
 
-        Write-Host ("[$ts2] Price: {0:F8} ETH  mean: {1:F8}  dip: {2:+0.4f}%  trigger: {3:F2}%  (thresh: {4:+0.4f}% away)" -f `
-            $currentETH, $rollingMeanETH, $dipPctCurrent, $DipPct, $pctVsThresh) -ForegroundColor $color
+        Write-Host ("[$ts2] Price: {0:F8} {5}  mean: {1:F8} {5}  dip: {2:F4}%  trigger: {3:F2}%  ({4:F4}% more dip vs mean to enter)" -f `
+            $currentETH, $rollingMeanETH, $dipPctCurrent, $DipPct, $dipNeeded, $script:BaseLabel) -ForegroundColor $color
 
         # Dip entry condition
         if ($currentRaw -le $dipThreshRaw) {
             Write-Host ""
-            Write-Host ("DIP detected! Price {0:F8} ETH <= threshold {1:F8} ETH  ({2:F4}% below mean)" -f `
-                $currentETH, ($dipThreshRaw / $ETH_DECIMALS), $dipPctCurrent) -ForegroundColor Green
+            Write-Host ("DIP detected! Price {0:F8} {3} <= threshold {1:F8} {3}  ({2:F4}% below mean)" -f `
+                $currentETH, ($dipThreshRaw / $script:BASE_DECIMALS_SCALE), $dipPctCurrent, $script:BaseLabel) -ForegroundColor Green
 
             if ($DryRun) {
-                Write-Host "  [DRY-RUN] Would BUY $Amount ETH of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                Write-Host "  [DRY-RUN] Would BUY $Amount $($script:BaseLabel) of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                $dryRunDipSeen = $true
             } else {
                 Write-Host ""
-                Write-Host "Executing dip buy: $Amount ETH -> $TokenLabel" -ForegroundColor Green
-                Write-Host ">>> speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor Cyan
-                speed swap -c $Chain --sell eth --buy $Token -a $Amount -y
+                Write-Host "Executing dip buy: $Amount $($script:BaseLabel) -> $TokenLabel" -ForegroundColor Green
+                Write-Host ">>> speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor Cyan
+                speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y
                 if ($LASTEXITCODE -ne 0) {
                     Write-Error "Dip buy failed (exit $LASTEXITCODE). Aborting."
                     exit $LASTEXITCODE
                 }
+                $actTokenRaw = $refTokenRaw
+                $actTokenHuman = $actTokenRaw / $TOKEN_SCALE
+                $refTokenStr   = $actTokenHuman.ToString("F$tokenDecimals")
                 Write-Host ""
 
                 Write-Host "Getting post-buy sell quote to anchor exit levels..." -ForegroundColor DarkCyan
-                $postBuyQ   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+                $postBuyQ   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
                 $postBuyRaw = [double]$postBuyQ.buyAmount
                 $tokenStr   = $refTokenStr
                 $entryRaw   = $postBuyRaw
                 $stopThreshRaw = $entryRaw * (1.0 - $StopPct / 100.0)
 
-                Write-Host ("  Entry price    : {0:F8} ETH  (for {1} {2})" -f ($postBuyRaw / $ETH_DECIMALS), $tokenStr, $TokenLabel) -ForegroundColor DarkGray
-                Write-Host ("  Hard stop      : {0:F8} ETH  (-{1}% from entry)" -f ($stopThreshRaw / $ETH_DECIMALS), $StopPct) -ForegroundColor DarkGray
+                Write-Host ("  Entry price    : {0:F8} {3}  (for {1} {2})" -f ($postBuyRaw / $script:BASE_DECIMALS_SCALE), $tokenStr, $TokenLabel, $script:BaseLabel) -ForegroundColor DarkGray
+                Write-Host ("  Hard stop      : {0:F8} {2}  (-{1}% from entry)" -f ($stopThreshRaw / $script:BASE_DECIMALS_SCALE), $StopPct, $script:BaseLabel) -ForegroundColor DarkGray
 
                 if ($TrailPct -gt 0) {
                     $peakRaw  = $postBuyRaw
                     $floorRaw = $peakRaw * (1.0 - $TrailPct / 100.0)
-                    Write-Host ("  Trail peak     : {0:F8} ETH" -f ($peakRaw / $ETH_DECIMALS)) -ForegroundColor DarkGray
-                    Write-Host ("  Trail floor    : {0:F8} ETH  (-{1}%)" -f ($floorRaw / $ETH_DECIMALS), $TrailPct) -ForegroundColor DarkGray
+                    Write-Host ("  Trail peak     : {0:F8} {1}" -f ($peakRaw / $script:BASE_DECIMALS_SCALE), $script:BaseLabel) -ForegroundColor DarkGray
+                    Write-Host ("  Trail floor    : {0:F8} {2}  (-{1}%)" -f ($floorRaw / $script:BASE_DECIMALS_SCALE), $TrailPct, $script:BaseLabel) -ForegroundColor DarkGray
                 } else {
                     $recoveryTarget = $rollingMean * (1.0 - $RecoverPct / 100.0)
-                    Write-Host ("  Recovery target: {0:F8} ETH  (mean - {1}%)" -f ($recoveryTarget / $ETH_DECIMALS), $RecoverPct) -ForegroundColor DarkGray
+                    Write-Host ("  Recovery target: {0:F8} {2}  (mean - {1}%)" -f ($recoveryTarget / $script:BASE_DECIMALS_SCALE), $RecoverPct, $script:BaseLabel) -ForegroundColor DarkGray
                 }
 
                 Write-Host ""
@@ -470,6 +483,9 @@ Write-Host ""
 if ($entryMade) {
     Write-Host "Max iterations ($MaxIterations) reached. Selling position..." -ForegroundColor Yellow
     Run-Sell $tokenStr
+} elseif ($DryRun -and $dryRunDipSeen) {
+    Write-Host "Max iterations ($MaxIterations) reached. Dry-run logged dip signal(s); no on-chain trade." -ForegroundColor Yellow
+    exit 0
 } else {
     Write-Host "Max iterations ($MaxIterations) reached. No dip detected. Exiting without a trade." -ForegroundColor Yellow
     exit 0

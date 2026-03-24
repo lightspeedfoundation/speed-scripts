@@ -1,17 +1,17 @@
 <#
 .SYNOPSIS
     Ladder buy: accumulate any token at N price levels below the current price.
-    Each time price dips to a rung trigger, buy -EthPerRung ETH worth of tokens.
+    Each time price dips to a rung trigger, buy -BasePerRung worth of -BaseToken.
     Optionally, when all rungs are filled, start a trailing stop on the full
     accumulated position.
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes -EthPerRung ETH -> <Token> to derive a reference token amount.
-    3. Quotes that reference amount back to ETH to establish the baseline price.
+    2. Quotes -BasePerRung of -BaseToken -> <Token> to derive a reference token amount.
+    3. Quotes that reference amount back to -BaseToken to establish the baseline price.
     4. Builds -Rungs buy trigger levels below baseline, spaced -RungSpacingPct apart.
     5. Polls every -PollSeconds seconds. When price drops to a rung's trigger
-       level, buys -EthPerRung ETH worth of tokens.
+       level, buys -BasePerRung of -BaseToken worth of tokens.
     6. Tracks the accumulated token position.
     7. If -TrailAfterN > 0, switches into trailing stop mode on the accumulated
        position once that many rungs have filled (does not require all rungs).
@@ -22,10 +22,10 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    P&L and prices are measured in -BaseToken (default: speed).
 
-.PARAMETER EthPerRung
-    ETH to spend at each buy trigger (min ~0.0001 ETH).
+.PARAMETER BasePerRung
+    Amount of -BaseToken to spend at each buy trigger (min ~0.0001 base units).
 
 .PARAMETER Rungs
     Number of buy levels to set below current price. Default: 4.
@@ -49,17 +49,17 @@
     Print what would happen without executing any swaps. Quotes still run.
 
 .EXAMPLE
-    .\ladder-buy-any.ps1 -Chain base -Token speed -EthPerRung 0.001 -Rungs 4 -RungSpacingPct 5
-    .\ladder-buy-any.ps1 -Chain base -Token speed -EthPerRung 0.001 -Rungs 4 -RungSpacingPct 5 -TrailAfterFilled -TrailPct 4
-    .\ladder-buy-any.ps1 -Chain base -Token speed -EthPerRung 0.001 -Rungs 4 -RungSpacingPct 5 -TrailAfterN 2 -TrailPct 4
-    .\ladder-buy-any.ps1 -Chain base -Token 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf -TokenSymbol cbBTC -EthPerRung 0.002 -Rungs 3 -RungSpacingPct 3 -TrailAfterFilled -TrailPct 4 -PollSeconds 30
-    .\ladder-buy-any.ps1 -Chain base -Token speed -EthPerRung 0.001 -Rungs 5 -RungSpacingPct 3 -DryRun
+    .\ladder-buy-any.ps1 -Chain base -Token speed -BasePerRung 0.001 -Rungs 4 -RungSpacingPct 5
+    .\ladder-buy-any.ps1 -Chain base -Token speed -BasePerRung 0.001 -Rungs 4 -RungSpacingPct 5 -TrailAfterFilled -TrailPct 4
+    .\ladder-buy-any.ps1 -Chain base -Token speed -BasePerRung 0.001 -Rungs 4 -RungSpacingPct 5 -TrailAfterN 2 -TrailPct 4
+    .\ladder-buy-any.ps1 -Chain base -Token 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf -TokenSymbol cbBTC -BasePerRung 0.002 -Rungs 3 -RungSpacingPct 3 -TrailAfterFilled -TrailPct 4 -PollSeconds 30
+    .\ladder-buy-any.ps1 -Chain base -Token speed -BasePerRung 0.001 -Rungs 5 -RungSpacingPct 3 -DryRun
 #>
 
 param(
     [Parameter(Mandatory)][string] $Chain,
     [Parameter(Mandatory)][string] $Token,
-    [Parameter(Mandatory)][string] $EthPerRung,
+    [Parameter(Mandatory)][string] $BasePerRung,
     [string]                       $TokenSymbol     = "",
     [int]                          $Rungs           = 4,
     [double]                       $RungSpacingPct  = 5.0,
@@ -68,13 +68,15 @@ param(
     [switch]                       $TrailAfterFilled,
     [int]                          $PollSeconds     = 60,
     [int]                          $MaxIterations   = 2880,
-    [switch]                       $DryRun
+    [switch]                       $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -141,7 +143,7 @@ function Get-Quote {
 
 function Invoke-RungBuy {
     param([int]$rungIndex, [double]$triggerETH)
-    $q          = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $EthPerRung
+    $q          = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $BasePerRung
     $tokenRaw   = [double]$q.buyAmount
     $tokenHuman = $tokenRaw / $script:TOKEN_SCALE
     $tokenStr   = $tokenHuman.ToString("F$script:tokenDecimals")
@@ -149,19 +151,19 @@ function Invoke-RungBuy {
     if ([double]$tokenStr -le 0) { throw "Token amount resolved to 0 for rung $rungIndex." }
 
     if ($DryRun) {
-        Write-Host ("  [DRY-RUN] Rung {0}: would BUY {1} {2} for {3} ETH  (trigger: {4:F8} ETH)" -f `
-            $rungIndex, $tokenStr, $script:TokenLabel, $EthPerRung, $triggerETH) -ForegroundColor DarkYellow
+        Write-Host ("  [DRY-RUN] Rung {0}: would BUY {1} {2} for {3} {5}  (trigger: {4:F8} {5})" -f `
+            $rungIndex, $tokenStr, $script:TokenLabel, $BasePerRung, $triggerETH, $script:BaseLabel) -ForegroundColor DarkYellow
     } else {
-        Write-Host ("  >>> Rung {0} BUY: speed swap -c {1} --sell eth --buy {2} -a {3} -y  (price: {4:F8} ETH)" -f `
-            $rungIndex, $Chain, $Token, $EthPerRung, $triggerETH) -ForegroundColor Cyan
-        $raw2  = speed --json --yes swap -c $Chain --sell eth --buy $Token -a $EthPerRung 2>&1
-        $line2 = $raw2 | Where-Object { $_ -match '^\{' } | Select-Object -First 1
-        $res   = $line2 | ConvertFrom-Json
-        if ($res.PSObject.Properties.Name -contains 'error') { throw "Buy swap failed: $($res.error)" }
-        Write-Host ("  TX: {0}" -f $res.txHash) -ForegroundColor DarkGray
+        Write-Host ("  >>> Rung {0} BUY: speed swap -c {1} --sell $BaseToken --buy {2} -a {3} -y  (price: {4:F8} {5})" -f `
+            $rungIndex, $Chain, $Token, $BasePerRung, $triggerETH, $script:BaseLabel) -ForegroundColor Cyan
+        speed swap -c $Chain --sell $BaseToken --buy $Token -a $BasePerRung -y
+        if ($LASTEXITCODE -ne 0) { throw "Buy swap failed (exit $LASTEXITCODE)." }
+        $actRaw = [double]$q.buyAmount
+        $tokenHuman = $actRaw / $script:TOKEN_SCALE
+        $tokenStr   = $tokenHuman.ToString("F$script:tokenDecimals")
     }
 
-    $script:totalEthSpent  += [double]$EthPerRung
+    $script:totalEthSpent  += [double]$BasePerRung
     $script:totalBuys++
     $script:accTokenHuman  += $tokenHuman
     return $tokenStr
@@ -171,12 +173,12 @@ function Run-SellAll {
     param([string]$accTokenStr)
     Write-Host ""
     if ($DryRun) {
-        Write-Host ("  [DRY-RUN] Would SELL all accumulated {0} {1} -> ETH" -f $accTokenStr, $script:TokenLabel) -ForegroundColor DarkYellow
+        Write-Host ("  [DRY-RUN] Would SELL all accumulated {0} {1} -> {2}" -f $accTokenStr, $script:TokenLabel, $script:BaseLabel) -ForegroundColor DarkYellow
         return
     }
-    Write-Host (">>> Selling all accumulated tokens: speed swap -c {0} --sell {1} --buy eth -a {2} -y" -f `
+    Write-Host (">>> Selling all accumulated tokens: speed swap -c {0} --sell {1} --buy $BaseToken -a {2} -y" -f `
         $Chain, $Token, $accTokenStr) -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $accTokenStr -y
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $accTokenStr -y
     exit $LASTEXITCODE
 }
 
@@ -189,7 +191,13 @@ $script:tokenDecimals = $tokenDecimals
 $script:TOKEN_SCALE  = [Math]::Pow(10, $tokenDecimals)
 $script:TokenLabel   = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
-$totalEthRequired = [double]$EthPerRung * $Rungs
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
+$totalEthRequired = [double]$BasePerRung * $Rungs
 
 # Backward-compat: -TrailAfterFilled is an alias for -TrailAfterN $Rungs
 if ($TrailAfterFilled -and $TrailAfterN -eq 0) { $TrailAfterN = $Rungs }
@@ -199,10 +207,10 @@ Write-Host "=== Speed Ladder Buy ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- no swaps will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain            : $Chain"
 Write-Host "  Token            : $script:TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  ETH per rung     : $EthPerRung ETH"
+Write-Host "  Base per rung    : $BasePerRung $($script:BaseLabel)"
 Write-Host "  Rungs            : $Rungs"
 Write-Host "  Rung spacing     : $RungSpacingPct % drop per level"
-Write-Host ("  Max ETH outlay   : {0:F8} ETH (if all rungs fill)" -f $totalEthRequired)
+Write-Host ("  Max base outlay  : {0:F8} {1} (if all rungs fill)" -f $totalEthRequired, $script:BaseLabel)
 if ($TrailAfterN -gt 0) {
     $trailLabel = if ($TrailAfterN -eq $Rungs) { "all $Rungs rungs" } else { "$TrailAfterN of $Rungs rungs" }
     Write-Host "  Trail after      : $TrailPct % trailing stop after $trailLabel fill"
@@ -213,9 +221,9 @@ Write-Host ""
 
 # -- step 1: reference quote ---------------------------------------------------
 
-Write-Host "Step 1 - Quoting $EthPerRung ETH -> $script:TokenLabel to establish reference..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $BasePerRung $($script:BaseLabel) -> $script:TokenLabel to establish reference..." -ForegroundColor DarkCyan
 
-$refBuyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $EthPerRung
+$refBuyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $BasePerRung
 $refTokenRaw   = [double]$refBuyQuote.buyAmount
 $refTokenHuman = $refTokenRaw / $script:TOKEN_SCALE
 $refTokenStr   = $refTokenHuman.ToString("F$tokenDecimals")
@@ -224,18 +232,18 @@ if ([double]$refTokenStr -le 0) {
     Write-Error "Reference token amount resolved to 0. Aborting."
     exit 1
 }
-Write-Host ("  Reference amount : {0} {1} per {2} ETH grid" -f $refTokenStr, $script:TokenLabel, $EthPerRung)
+Write-Host ("  Reference amount : {0} {1} per {2} {3} grid" -f $refTokenStr, $script:TokenLabel, $BasePerRung, $script:BaseLabel)
 
 # -- step 2: baseline price ----------------------------------------------------
 
 Write-Host ""
-Write-Host "Step 2 - Quoting $script:TokenLabel -> ETH to establish baseline price..." -ForegroundColor DarkCyan
+Write-Host "Step 2 - Quoting $script:TokenLabel -> $($script:BaseLabel) to establish baseline price..." -ForegroundColor DarkCyan
 
-$baseSellQuote = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+$baseSellQuote = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
 $baseRaw       = [double]$baseSellQuote.buyAmount
-$baseETH       = $baseRaw / $ETH_DECIMALS
+$baseETH       = $baseRaw / $script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Baseline price : {0:F8} ETH (for {1} {2})" -f $baseETH, $refTokenStr, $script:TokenLabel)
+Write-Host ("  Baseline price : {0:F8} {3} (for {1} {2})" -f $baseETH, $refTokenStr, $script:TokenLabel, $script:BaseLabel)
 Write-Host ""
 
 # -- step 3: build rung triggers -----------------------------------------------
@@ -246,7 +254,7 @@ $rungCells = @()
 for ($i = 0; $i -lt $Rungs; $i++) {
     $dropPct     = ($i + 1) * $RungSpacingPct
     $triggerRaw  = $baseRaw * (1.0 - $dropPct / 100.0)
-    $triggerETH  = $triggerRaw / $ETH_DECIMALS
+    $triggerETH  = $triggerRaw / $script:BASE_DECIMALS_SCALE
     $rungCells  += [PSCustomObject]@{
         Index       = $i
         DropPct     = $dropPct
@@ -255,8 +263,8 @@ for ($i = 0; $i -lt $Rungs; $i++) {
         Status      = "waiting"   # "waiting" | "filled"
         TokenStr    = ""
     }
-    Write-Host ("  Rung {0}: buy {1} ETH when price drops {2}%  (trigger: {3:F8} ETH)" -f `
-        $i, $EthPerRung, $dropPct, $triggerETH) -ForegroundColor DarkGray
+    Write-Host ("  Rung {0}: buy {1} {4} when price drops {2}%  (trigger: {3:F8} {4})" -f `
+        $i, $BasePerRung, $dropPct, $triggerETH, $script:BaseLabel) -ForegroundColor DarkGray
 }
 Write-Host ""
 
@@ -274,9 +282,9 @@ while ($iteration -lt $MaxIterations) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $currentETH = $currentRaw / $script:BASE_DECIMALS_SCALE
         $pctFromBase= (($currentRaw - $baseRaw) / $baseRaw) * 100.0
         $ts2        = Get-Date -Format "HH:mm:ss"
 
@@ -288,16 +296,16 @@ while ($iteration -lt $MaxIterations) {
             $accStr = $script:accTokenHuman.ToString("F$tokenDecimals")
 
             # Re-quote actual accumulated amount for trail tracking
-            $accQuote  = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $accStr
+            $accQuote  = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $accStr
             $accRaw    = [double]$accQuote.buyAmount
-            $accETH    = $accRaw / $ETH_DECIMALS
+            $accETH    = $accRaw / $script:BASE_DECIMALS_SCALE
 
             if ($accRaw -gt $trailPeakRaw) {
                 $trailPeakRaw  = $accRaw
                 $trailFloorRaw = $trailPeakRaw * (1.0 - $TrailPct / 100.0)
             }
-            $trailPeakETH  = $trailPeakRaw  / $ETH_DECIMALS
-            $trailFloorETH = $trailFloorRaw / $ETH_DECIMALS
+            $trailPeakETH  = $trailPeakRaw  / $script:BASE_DECIMALS_SCALE
+            $trailFloorETH = $trailFloorRaw / $script:BASE_DECIMALS_SCALE
             $pctFromPeak   = (($accRaw - $trailPeakRaw) / $trailPeakRaw) * 100.0
 
             $trailDist     = $trailPeakRaw - $trailFloorRaw
@@ -310,13 +318,13 @@ while ($iteration -lt $MaxIterations) {
                 $color = "Cyan"
             }
 
-            Write-Host ("[$ts2] TRAIL MODE  - acc pos: {0:F8} ETH  peak: {1:F8}  floor: {2:F8}  ({3:F4}% from peak)" -f `
-                $accETH, $trailPeakETH, $trailFloorETH, $pctFromPeak) -ForegroundColor $color
+            Write-Host ("[$ts2] TRAIL MODE  - acc pos: {0:F8} {4}  peak: {1:F8} {4}  floor: {2:F8} {4}  ({3:F4}% from peak)" -f `
+                $accETH, $trailPeakETH, $trailFloorETH, $pctFromPeak, $script:BaseLabel) -ForegroundColor $color
 
             if ($accRaw -le $trailFloorRaw) {
-                $gainPct = (($accRaw - ($script:totalEthSpent * $ETH_DECIMALS)) / ($script:totalEthSpent * $ETH_DECIMALS)) * 100.0
+                $gainPct = (($accRaw - ($script:totalEthSpent * $script:BASE_DECIMALS_SCALE)) / ($script:totalEthSpent * $script:BASE_DECIMALS_SCALE)) * 100.0
                 Write-Host ""
-                Write-Host ("Trail floor breached! {0:F8} ETH back  ({1:F4}% vs cost basis)" -f $accETH, $gainPct) -ForegroundColor Red
+                Write-Host ("Trail floor breached! {0:F8} {2} back  ({1:F4}% vs cost basis)" -f $accETH, $gainPct, $script:BaseLabel) -ForegroundColor Red
                 Run-SellAll -accTokenStr $accStr
             }
             continue
@@ -333,8 +341,8 @@ while ($iteration -lt $MaxIterations) {
             $color = "White"
         }
 
-        Write-Host ("[$ts2] Price: {0:F8} ETH  ({1:+0.0000}% from base)  Filled: {2}/{3}" -f `
-            $currentETH, $pctFromBase, $filledCount, $Rungs) -ForegroundColor $color
+        Write-Host ("[$ts2] Price: {0:F8} {4}  ({1:F4}% from base)  Filled: {2}/{3}" -f `
+            $currentETH, $pctFromBase, $filledCount, $Rungs, $script:BaseLabel) -ForegroundColor $color
 
         # Process buys  - closest rung first (highest trigger raw = least drop required)
         $pendingCells = $rungCells | Where-Object { $_.Status -eq "waiting" } | Sort-Object TriggerRaw -Descending
@@ -359,14 +367,14 @@ while ($iteration -lt $MaxIterations) {
             $trailLabel = if ($TrailAfterN -eq $Rungs) { "All $Rungs rungs" } else { "$filledCount/$Rungs rungs" }
             Write-Host ""
             Write-Host "$trailLabel filled! Switching to trailing stop mode..." -ForegroundColor Green
-            Write-Host ("  Accumulated: {0} {1}  (cost: {2:F8} ETH)" -f $accStr, $script:TokenLabel, $script:totalEthSpent) -ForegroundColor DarkGray
+            Write-Host ("  Accumulated: {0} {1}  (cost: {2:F8} {3})" -f $accStr, $script:TokenLabel, $script:totalEthSpent, $script:BaseLabel) -ForegroundColor DarkGray
 
-            $accQ          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $accStr
+            $accQ          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $accStr
             $trailPeakRaw  = [double]$accQ.buyAmount
             $trailFloorRaw = $trailPeakRaw * (1.0 - $TrailPct / 100.0)
             $inTrailMode   = $true
-            Write-Host ("  Trail peak    : {0:F8} ETH" -f ($trailPeakRaw / $ETH_DECIMALS)) -ForegroundColor DarkGray
-            Write-Host ("  Trail floor   : {0:F8} ETH  (-{1}%)" -f ($trailFloorRaw / $ETH_DECIMALS), $TrailPct) -ForegroundColor DarkGray
+            Write-Host ("  Trail peak    : {0:F8} {1}" -f ($trailPeakRaw / $script:BASE_DECIMALS_SCALE), $script:BaseLabel) -ForegroundColor DarkGray
+            Write-Host ("  Trail floor   : {0:F8} {2}  (-{1}%)" -f ($trailFloorRaw / $script:BASE_DECIMALS_SCALE), $TrailPct, $script:BaseLabel) -ForegroundColor DarkGray
             Write-Host ""
         } elseif ($filledCount -ge $Rungs -and $TrailAfterN -eq 0) {
             Write-Host ""
@@ -394,4 +402,4 @@ if ($script:accTokenHuman -gt 0) {
 Write-Host ""
 Write-Host "=== Ladder Buy Session Complete ===" -ForegroundColor Yellow
 Write-Host ("  Total buys   : {0}" -f $script:totalBuys)
-Write-Host ("  ETH spent    : {0:F8} ETH" -f $script:totalEthSpent)
+Write-Host ("  Base spent   : {0:F8} {1}" -f $script:totalEthSpent, $script:BaseLabel)

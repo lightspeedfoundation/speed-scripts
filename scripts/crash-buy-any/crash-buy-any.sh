@@ -22,6 +22,11 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../_common.sh
+source "$SCRIPT_DIR/../_common.sh"
+
+
 # --- defaults -----------------------------------------------------------------
 
 CHAIN=""
@@ -35,6 +40,8 @@ POLL_SECONDS=30
 MAX_ITERATIONS=2880
 TIME_STOP_MINUTES=0
 DRY_RUN=0
+BASE_TOKEN="speed"
+BASE_TOKEN_SYMBOL=""
 
 # --- arg parsing --------------------------------------------------------------
 
@@ -51,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --maxiterations)      MAX_ITERATIONS="$2";      shift 2 ;;
         --time-stop-minutes)  TIME_STOP_MINUTES="$2";   shift 2 ;;
         --dry-run)            DRY_RUN=1;                shift ;;
+        --base-token)         BASE_TOKEN="$2";       shift 2 ;;
+        --base-token-symbol) BASE_TOKEN_SYMBOL="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -59,8 +68,16 @@ if [[ -z "$CHAIN" || -z "$TOKEN" || -z "$AMOUNT" || -z "$CRASH_PCT" ]]; then
     echo "Usage: $0 --chain <chain> --token <addr|alias> --amount <eth> --crash-pct <pct> [--trail-pct <pct>] [--baseline-polls <n>] [--tokensymbol <name>] [--pollseconds <s>] [--maxiterations <n>] [--dry-run]" >&2
     exit 1
 fi
+
+BASE_TOKEN="$(speed_v2_resolve_base_token "$TOKEN" "$BASE_TOKEN")"
+BASE_DECIMALS=$(speed_v2_get_token_decimals "$BASE_TOKEN" "$CHAIN")
+BASE_SCALE=$(awk "BEGIN { printf \"%.0f\", 10 ^ $BASE_DECIMALS }")
+BASE_LABEL="$(speed_v2_base_label "$BASE_TOKEN_SYMBOL" "$BASE_TOKEN")"
 if (( BASELINE_POLLS < 1 )); then
     echo "--baseline-polls must be >= 1" >&2; exit 1
+fi
+if (( MAX_ITERATIONS <= BASELINE_POLLS )); then
+    echo "--maxiterations must be > --baseline-polls" >&2; exit 1
 fi
 
 # --- colours ------------------------------------------------------------------
@@ -90,67 +107,22 @@ get_rpc_url() {
 
 # --- helpers ------------------------------------------------------------------
 
-ETH_SCALE=1000000000000000000
 
-to_human_eth() {
-    awk "BEGIN { printf \"%.8f\", $1 / $ETH_SCALE }"
+to_human_base() {
+    awk "BEGIN { printf \"%.8f\", $1 / $BASE_SCALE }"
 }
 
 format_token() {
     awk "BEGIN { printf \"%.*f\", $2, $1 }"
 }
 
-extract_buy_amount() {
-    local json="$1"
-    echo "$json" | grep -oP '"buyAmount"\s*:\s*"\K[^"]+' 2>/dev/null || \
-    echo "$json" | grep -oP '"buyAmount"\s*:\s*\K[0-9]+' 2>/dev/null || \
-    echo ""
-}
+extract_buy_amount() { speed_v2_extract_buy_amount "$1"; }
 
-get_token_decimals() {
-    local token_addr="$1" chain="$2"
-    local lower="${token_addr,,}"
-    [[ "$lower" =~ ^(speed|eth|ether|native)$ ]] && echo 18 && return
-    [[ "$lower" != 0x* ]] && echo 18 && return
-
-    local rpc
-    rpc=$(get_rpc_url "$chain")
-    if [[ -z "$rpc" ]]; then
-        echo "Warning: unknown chain '$chain', assuming 18 decimals." >&2; echo 18; return
-    fi
-
-    local body="{\"jsonrpc\":\"2.0\",\"method\":\"eth_call\",\"params\":[{\"to\":\"$token_addr\",\"data\":\"0x313ce567\"},\"latest\"],\"id\":1}"
-    local resp
-    resp=$(curl -sf -X POST "$rpc" -H "Content-Type: application/json" -d "$body" 2>/dev/null) || {
-        echo "Warning: RPC call failed, assuming 18 decimals." >&2; echo 18; return
-    }
-
-    local result_field hex
-    result_field=$(echo "$resp" | grep -oP '"result"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
-    if [[ -z "$result_field" || "$result_field" == "0x" ]]; then
-        echo "Warning: empty decimals result, assuming 18." >&2; echo 18; return
-    fi
-
-    hex="${result_field#0x}"
-    hex=$(echo "$hex" | sed 's/^0*//')
-    [[ -z "$hex" ]] && hex="0"
-    echo "obase=10; ibase=16; ${hex^^}" | bc 2>/dev/null || echo 18
-}
+get_token_decimals() { speed_v2_get_token_decimals "$1" "$2"; }
 
 get_quote() {
     local sell_tok="$1" buy_tok="$2" sell_amt="$3"
-    local output json
-    output=$(speed quote --json -c "$CHAIN" --sell "$sell_tok" --buy "$buy_tok" -a "$sell_amt" 2>&1)
-    json=$(echo "$output" | grep -m1 '^{' || echo "")
-    if [[ -z "$json" ]]; then
-        echo "No JSON from quote. Output: $output" >&2; return 1
-    fi
-    if echo "$json" | grep -q '"error"'; then
-        local err
-        err=$(echo "$json" | grep -oP '"error"\s*:\s*"\K[^"]+' || echo "$json")
-        echo "Quote error: $err" >&2; return 1
-    fi
-    echo "$json"
+    speed_v2_get_quote "$CHAIN" "$sell_tok" "$buy_tok" "$sell_amt"
 }
 
 awk_gte() { awk "BEGIN { exit ($1 >= $2) ? 0 : 1 }"; }
@@ -184,10 +156,10 @@ echo -e "${YELLOW}=== Speed Crash Buy ===${RESET}"
 [[ "$DRY_RUN" == "1" ]] && echo -e "${YELLOW}  *** DRY-RUN MODE -- crash signals logged, no buy will execute ***${RESET}"
 echo "  Chain          : $CHAIN"
 echo "  Token          : $TOKEN_LABEL  (decimals: $TOKEN_DECIMALS)"
-echo "  Buy amount     : $AMOUNT ETH  (on crash)"
-echo "  Crash trigger  : ${CRASH_PCT}% drop vs $baseline_label"
+echo "  Buy amount     : $AMOUNT $BASE_LABEL  (on crash)"
+echo "  Crash trigger  : ${CRASH_PCT} % drop vs $baseline_label"
 echo "  Baseline polls : $BASELINE_POLLS  (window warm-up: $BASELINE_POLLS polls)"
-echo "  Trail pct      : ${TRAIL_PCT}% drop from peak triggers sell"
+echo "  Trail pct      : ${TRAIL_PCT} % drop from peak triggers sell"
 echo "  Poll interval  : $POLL_SECONDS s"
 echo "  Max polls      : $MAX_ITERATIONS"
 (( TIME_STOP_MINUTES > 0 )) && echo "  Time stop      : ${TIME_STOP_MINUTES} min  (exits at thesis timeout regardless of price)"
@@ -195,27 +167,27 @@ echo ""
 
 # --- step 1: reference quote --------------------------------------------------
 
-echo -e "${CYAN}Step 1 - Quoting $AMOUNT ETH -> $TOKEN_LABEL (reference, no buy yet)...${RESET}"
+echo -e "${CYAN}Step 1 - Quoting $AMOUNT $BASE_LABEL -> $TOKEN_LABEL (reference, no buy yet)...${RESET}"
 
-ref_buy_json=$(get_quote "eth" "$TOKEN" "$AMOUNT")
+ref_buy_json=$(get_quote "$BASE_TOKEN" "$TOKEN" "$AMOUNT")
 ref_token_raw=$(extract_buy_amount "$ref_buy_json")
 [[ -z "$ref_token_raw" ]] && { echo "Failed to parse ref buyAmount. Aborting." >&2; exit 1; }
 
 ref_token_human=$(awk "BEGIN { printf \"%.${TOKEN_DECIMALS}f\", $ref_token_raw / $TOKEN_SCALE }")
 ref_token_str=$(awk "BEGIN { printf \"%.*f\", $TOKEN_DECIMALS, $ref_token_human }")
 awk_gt "$ref_token_str" "0" || { echo "Reference amount resolved to 0. Aborting." >&2; exit 1; }
-echo "  Reference amount : $ref_token_str $TOKEN_LABEL for $AMOUNT ETH"
+echo "  Reference amount : $ref_token_str $TOKEN_LABEL for $AMOUNT $BASE_LABEL"
 
 # --- step 2: initial price ----------------------------------------------------
 
 echo ""
 echo -e "${CYAN}Step 2 - Getting initial price...${RESET}"
 
-init_sell_json=$(get_quote "$TOKEN" "eth" "$ref_token_str")
+init_sell_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str")
 init_raw=$(extract_buy_amount "$init_sell_json")
 [[ -z "$init_raw" ]] && { echo "Failed to parse initial price. Aborting." >&2; exit 1; }
-init_eth=$(to_human_eth "$init_raw")
-echo "  Initial price : $init_eth ETH  (for $ref_token_str $TOKEN_LABEL)"
+init_eth=$(to_human_base "$init_raw")
+echo "  Initial price : $init_eth $BASE_LABEL  (for $ref_token_str $TOKEN_LABEL)"
 echo ""
 
 # Seed baseline window with initial price
@@ -244,8 +216,8 @@ while (( iteration < MAX_ITERATIONS )); do
             echo ""
             if [[ "$entry_made" == "1" ]]; then
                 echo -e "${YELLOW}Time stop reached (${elapsed_min}m elapsed). Selling open position.${RESET}"
-                echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy eth -a $token_str -y${RESET}"
-                speed swap -c "$CHAIN" --sell "$TOKEN" --buy eth -a "$token_str" -y
+                echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy ${BASE_TOKEN} -a $token_str -y${RESET}"
+                speed swap -c "$CHAIN" --sell "$TOKEN" --buy "$BASE_TOKEN" -a "$token_str" -y
                 exit $?
             else
                 echo -e "${YELLOW}Time stop reached (${elapsed_min}m elapsed). Thesis did not play out. Exiting without a trade.${RESET}"
@@ -254,7 +226,7 @@ while (( iteration < MAX_ITERATIONS )); do
         fi
     fi
 
-    poll_json=$(get_quote "$TOKEN" "eth" "$ref_token_str" 2>&1) || {
+    poll_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str" 2>&1) || {
         echo "Warning: quote failed on poll $iteration - retrying."
         continue
     }
@@ -265,23 +237,23 @@ while (( iteration < MAX_ITERATIONS )); do
         continue
     fi
 
-    current_eth=$(to_human_eth "$current_raw")
+    current_eth=$(to_human_base "$current_raw")
     ts2=$(date +"%H:%M:%S")
 
     # ── post-entry: trailing stop ──────────────────────────────────────────────
     if [[ "$entry_made" == "1" ]]; then
-        tq_json=$(get_quote "$TOKEN" "eth" "$token_str" 2>&1) || { echo "Warning: trail quote failed - retrying."; continue; }
+        tq_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$token_str" 2>&1) || { echo "Warning: trail quote failed - retrying."; continue; }
         t_raw=$(extract_buy_amount "$tq_json")
         [[ -z "$t_raw" ]] && { echo "Warning: empty trail buyAmount - retrying."; continue; }
-        t_eth=$(to_human_eth "$t_raw")
+        t_eth=$(to_human_base "$t_raw")
 
         if awk_gt "$t_raw" "$peak_raw"; then
             peak_raw="$t_raw"
             floor_raw=$(awk "BEGIN { printf \"%.0f\", $peak_raw * (1 - $TRAIL_PCT / 100) }")
         fi
 
-        peak_eth=$(to_human_eth "$peak_raw")
-        floor_eth=$(to_human_eth "$floor_raw")
+        peak_eth=$(to_human_base "$peak_raw")
+        floor_eth=$(to_human_base "$floor_raw")
         pct_from_peak=$(awk "BEGIN { printf \"%.4f\", ($t_raw - $peak_raw) / $peak_raw * 100 }")
 
         trail_dist=$(awk "BEGIN { printf \"%.0f\", $peak_raw - $floor_raw }")
@@ -295,17 +267,17 @@ while (( iteration < MAX_ITERATIONS )); do
             color="$WHITE"
         fi
 
-        echo -e "${color}[$ts2] POST-ENTRY  $t_eth ETH  peak: $peak_eth  floor: $floor_eth  (${pct_from_peak}% from peak)${RESET}"
+        echo -e "${color}[$ts2] POST-ENTRY  $t_eth $BASE_LABEL  peak: $peak_eth  floor: $floor_eth  (${pct_from_peak}% from peak)${RESET}"
 
         if awk_lte "$t_raw" "$floor_raw"; then
             gain_pct=$(awk "BEGIN { printf \"%.4f\", ($t_eth - $AMOUNT) / $AMOUNT * 100 }")
             echo ""
-            echo -e "${RED}Trail floor breached! $t_eth ETH back  (${gain_pct}% vs entry cost)${RESET}"
+            echo -e "${RED}Trail floor breached! $t_eth $BASE_LABEL back  (${gain_pct}% vs entry cost)${RESET}"
             if [[ "$DRY_RUN" == "1" ]]; then
-                echo -e "${YELLOW}[DRY-RUN] Would SELL $token_str $TOKEN_LABEL -> ETH${RESET}"; exit 0
+                echo -e "${YELLOW}[DRY-RUN] Would SELL $token_str $TOKEN_LABEL -> $BASE_LABEL${RESET}"; exit 0
             fi
-            echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy eth -a $token_str -y${RESET}"
-            speed swap -c "$CHAIN" --sell "$TOKEN" --buy eth -a "$token_str" -y
+            echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy ${BASE_TOKEN} -a $token_str -y${RESET}"
+            speed swap -c "$CHAIN" --sell "$TOKEN" --buy "$BASE_TOKEN" -a "$token_str" -y
             exit $?
         fi
         continue
@@ -332,7 +304,7 @@ while (( iteration < MAX_ITERATIONS )); do
     baseline_raw=$(awk "BEGIN {
         n=split(\"$baseline_values\", a, \" \"); s=0; for(i=1;i<=n;i++) s+=a[i]; printf \"%.0f\", s/n
     }")
-    baseline_eth=$(to_human_eth "$baseline_raw")
+    baseline_eth=$(to_human_base "$baseline_raw")
 
     drop_pct=$(awk "BEGIN { printf \"%+.4f\", ($baseline_raw > 0) ? ($baseline_raw - $current_raw) / $baseline_raw * 100 : 0 }")
     pct_to_trig=$(awk "BEGIN { printf \"%+.4f\", $CRASH_PCT - ${drop_pct#+} }")
@@ -347,26 +319,26 @@ while (( iteration < MAX_ITERATIONS )); do
         color="$GRAY"
     fi
 
-    echo -e "${color}[$ts2] Price: $current_eth ETH  baseline: $baseline_eth  drop: ${drop_pct}%  trigger: ${CRASH_PCT}%  (${pct_to_trig}% away)${RESET}"
+    echo -e "${color}[$ts2] Price: $current_eth $BASE_LABEL  baseline: $baseline_eth  drop: ${drop_pct}%  trigger: ${CRASH_PCT}%  (${pct_to_trig}% away)${RESET}"
 
     # Crash entry condition
     if awk "BEGIN { exit (${drop_pct#+} >= $CRASH_PCT) ? 0 : 1 }" 2>/dev/null; then
         echo ""
-        echo -e "${GREEN}CRASH detected! Price dropped ${drop_pct}% vs ${BASELINE_POLLS}-poll baseline  ($baseline_eth ETH -> $current_eth ETH)${RESET}"
+        echo -e "${GREEN}CRASH detected! Price dropped ${drop_pct}% vs ${BASELINE_POLLS}-poll baseline  ($baseline_eth $BASE_LABEL -> $current_eth $BASE_LABEL)${RESET}"
 
         if [[ "$DRY_RUN" == "1" ]]; then
-            echo -e "${YELLOW}  [DRY-RUN] Would BUY $AMOUNT ETH of $TOKEN_LABEL now. Continuing to observe...${RESET}"
+            echo -e "${YELLOW}  [DRY-RUN] Would BUY $AMOUNT $BASE_LABEL of $TOKEN_LABEL now. Continuing to observe...${RESET}"
         else
             echo ""
-            echo -e "${GREEN}Executing crash buy: $AMOUNT ETH -> $TOKEN_LABEL${RESET}"
-            echo -e "${CYAN}>>> speed swap -c $CHAIN --sell eth --buy $TOKEN -a $AMOUNT -y${RESET}"
-            speed swap -c "$CHAIN" --sell eth --buy "$TOKEN" -a "$AMOUNT" -y || {
+            echo -e "${GREEN}Executing crash buy: $AMOUNT $BASE_LABEL -> $TOKEN_LABEL${RESET}"
+            echo -e "${CYAN}>>> speed swap -c $CHAIN --sell ${BASE_TOKEN} --buy $TOKEN -a $AMOUNT -y${RESET}"
+            speed swap -c "$CHAIN" --sell "$BASE_TOKEN" --buy "$TOKEN" -a "$AMOUNT" -y || {
                 echo "Crash buy failed. Aborting." >&2; exit 1
             }
             echo ""
 
             echo -e "${CYAN}Getting post-buy quote to anchor trailing stop...${RESET}"
-            post_buy_json=$(get_quote "$TOKEN" "eth" "$ref_token_str" 2>&1) || { echo "Post-buy quote failed. Aborting." >&2; exit 1; }
+            post_buy_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str" 2>&1) || { echo "Post-buy quote failed. Aborting." >&2; exit 1; }
             post_buy_raw=$(extract_buy_amount "$post_buy_json")
             [[ -z "$post_buy_raw" ]] && { echo "Empty post-buy raw. Aborting." >&2; exit 1; }
 
@@ -375,12 +347,12 @@ while (( iteration < MAX_ITERATIONS )); do
             floor_raw=$(awk "BEGIN { printf \"%.0f\", $peak_raw * (1 - $TRAIL_PCT / 100) }")
             entry_made=1
 
-            entry_eth=$(to_human_eth "$post_buy_raw")
-            peak_eth=$(to_human_eth "$peak_raw")
-            floor_eth=$(to_human_eth "$floor_raw")
-            echo -e "${GRAY}  Entry price  : $entry_eth ETH  (for $token_str $TOKEN_LABEL)${RESET}"
-            echo -e "${GRAY}  Trail peak   : $peak_eth ETH${RESET}"
-            echo -e "${GRAY}  Trail floor  : $floor_eth ETH  (-${TRAIL_PCT}%)${RESET}"
+            entry_eth=$(to_human_base "$post_buy_raw")
+            peak_eth=$(to_human_base "$peak_raw")
+            floor_eth=$(to_human_base "$floor_raw")
+            echo -e "${GRAY}  Entry price  : $entry_eth $BASE_LABEL  (for $token_str $TOKEN_LABEL)${RESET}"
+            echo -e "${GRAY}  Trail peak   : $peak_eth $BASE_LABEL${RESET}"
+            echo -e "${GRAY}  Trail floor  : $floor_eth $BASE_LABEL  (-${TRAIL_PCT}%)${RESET}"
             echo ""
         fi
     fi
@@ -392,8 +364,8 @@ done
 echo ""
 if [[ "$entry_made" == "1" ]]; then
     echo -e "${YELLOW}Max iterations ($MAX_ITERATIONS) reached. Selling position...${RESET}"
-    echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy eth -a $token_str -y${RESET}"
-    speed swap -c "$CHAIN" --sell "$TOKEN" --buy eth -a "$token_str" -y
+    echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy ${BASE_TOKEN} -a $token_str -y${RESET}"
+    speed swap -c "$CHAIN" --sell "$TOKEN" --buy "$BASE_TOKEN" -a "$token_str" -y
 else
     echo -e "${YELLOW}Max iterations ($MAX_ITERATIONS) reached. No crash detected. Exiting without a trade.${RESET}"
 fi

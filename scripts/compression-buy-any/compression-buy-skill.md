@@ -1,3 +1,16 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+Spend/quote amounts (e.g. `-Amount`, `-TotalAmount`, `-BasePerGrid`, `-BasePerRung`) are in **units of the base token**. Use `../scripts/` if you want ETH-only bots unchanged.
+
+---
+
 # Compression Buy Skill
 
 Complete reference for `compression-buy-any.ps1` and `compression-buy-any.sh` — a volatility-entry bot that waits for price to coil into a tight range before entering on the breakout.
@@ -42,31 +55,35 @@ The rationale:
 WATCHING   -> range <= CompressionPct: transition to ARMED
 ARMED      -> price >= windowHigh * (1 + ExpansionPct/100): ENTRY
 ARMED      -> range > CompressionPct: transition back to WATCHING (compression lost)
-ARMED      -> ArmTimeout polls elapsed without expansion: transition back to WATCHING (reset)
+ARMED      -> ArmTimeout **monitoring** polls elapsed while still compressed, without entry: transition back to WATCHING (reset). Counter increments only while `armed` stays true and range stays compressed.
 ```
 
 ---
 
 ## 2. Parameters Reference
 
-| Parameter (PS1)   | Flag (SH)             | Type    | Default | Description |
+| Parameter (PS1)     | Flag (SH)               | Type    | Default | Description |
 |---|---|---|---|---|
-| `-Chain`          | `--chain`             | string  | required | Chain name or ID (`base`, `ethereum`, etc.) |
-| `-Token`          | `--token`             | string  | required | Token contract address or alias (`speed`). ETH is always the quote currency. |
-| `-Amount`         | `--amount`            | string  | required | ETH to spend when expansion is confirmed. |
-| `-WindowPolls`    | `--window-polls`      | integer | `20`    | Rolling window size for range and mean. Warm-up requires this many polls. |
-| `-CompressionPct` | `--compression-pct`   | float   | `3`     | Max rolling range as % of mean to be considered compressed (arm condition). Lower = tighter squeeze required. |
-| `-ExpansionPct`   | `--expansion-pct`     | float   | `1`     | Min % above window high while armed to trigger entry. 0 = any break above high. |
-| `-TrailPct`       | `--trail-pct`         | float   | `5`     | Trailing stop % applied post-entry. |
-| `-ArmTimeout`     | `--arm-timeout`       | integer | `0`     | Polls armed without expansion before auto-resetting. 0 = never auto-reset. |
-| `-TokenSymbol`    | `--tokensymbol`       | string  | address | Display label for the token. |
-| `-PollSeconds`    | `--pollseconds`       | integer | `60`    | Seconds between price polls. |
-| `-MaxIterations`  | `--maxiterations`     | integer | `1440`  | Max total polls. Sells if entry made; exits cleanly if not. |
-| `-DryRun`         | `--dry-run`           | switch  | off     | Log compression/expansion signals without executing any swaps. |
+| `-Chain`            | `--chain`               | string  | required | Chain name or ID (`base`, `ethereum`, etc.) |
+| `-Token`            | `--token`               | string  | required | Token contract address or alias (`speed`). |
+| `-Amount`           | `--amount`              | string  | required | **Base token** units to spend when expansion is confirmed (same asset as `-BaseToken`). |
+| `-WindowPolls`      | `--window-polls`        | integer | `20`    | Rolling window length (samples). After the initial price, the script runs **`WindowPolls − 1`** additional warm-up polls so the window holds **`WindowPolls`** prices before monitoring. |
+| `-CompressionPct`  | `--compression-pct`     | float   | `3`     | Max rolling range as % of mean to be considered compressed (arm condition). Lower = tighter squeeze required. Must be **> 0** (validated). |
+| `-ExpansionPct`    | `--expansion-pct`       | float   | see below | Min % above window high while armed to trigger entry. **≥ 0**; `0` = any break at/above window high (PS1 emits a warning). **Default differs:** PowerShell **`0.5`**, Bash **`1`** — set explicitly for parity. |
+| `-TrailPct`        | `--trail-pct`           | float   | `5`     | Trailing stop % applied post-entry. Must be **> 0** (validated). |
+| `-ArmTimeout`      | `--arm-timeout`         | integer | `0`     | Polls armed without expansion before auto-resetting. `0` = never auto-reset. Must be **≥ 0**. |
+| `-TokenSymbol`     | `--tokensymbol`         | string  | address | Display label for the token. |
+| `-PollSeconds`     | `--pollseconds`         | integer | `60`    | Seconds between price polls. |
+| `-MaxIterations`   | `--maxiterations`       | integer | `1440`  | Max total polls. Sells if entry made; exits cleanly if not. |
+| `-BaseToken`       | `--base-token`          | string  | `speed` | Asset for quotes and spend. If equal to `-Token`, resolves to `eth`. |
+| `-BaseTokenSymbol` | `--base-token-symbol`   | string  | *(empty)* | Display label for the base token in logs. |
+| `-DryRun`          | `--dry-run`             | switch  | off     | Log compression/expansion signals without executing any swaps. |
 
 ---
 
 ## 3. Detection Math
+
+All “prices” in the window are **base-token amounts returned** for selling the fixed reference size `refTokenStr` (same oracle as other v2 bots: token → base).
 
 ### Rolling window stats (computed every poll)
 
@@ -111,17 +128,17 @@ SELL when currentRaw <= floorRaw
 
 ```
 Step 1 — Reference quote
-  Quote Amount ETH -> Token (no buy). Record refTokenStr.
+  Quote Amount BaseToken -> Token (no buy). Record refTokenStr.
 
 Step 2 — Initial price
-  Quote refTokenStr -> ETH. Seed rolling window.
+  Quote refTokenStr -> BaseToken. Seed rolling window (first sample).
 
 Step 3 — Warm-up
-  Poll WindowPolls times to fill the rolling window.
-  Display range% and sample count each poll.
+  Run WindowPolls − 1 additional polls (after Step 2) so the window contains
+  WindowPolls samples total. Display range% and sample count each poll.
 
 Step 4 — Monitoring loop
-  Each poll: quote refTokenStr -> ETH = currentRaw
+  Each poll: quote refTokenStr -> BaseToken = currentRaw
   Update window, recompute rollingRange, windowHigh
 
   IF entry already made: trailing stop mode (same as momentum-any)
@@ -130,9 +147,9 @@ Step 4 — Monitoring loop
     WATCHING:
       If rollingRange <= CompressionPct: -> ARMED  (print "-- ARMED")
     ARMED:
-      If rollingRange > CompressionPct: -> WATCHING  (print "COMPRESSION LOST")
-      Else: increment armPollCount
-        If ArmTimeout > 0 and armPollCount >= ArmTimeout: -> WATCHING  (print "ARM TIMEOUT")
+      If rollingRange > CompressionPct: -> WATCHING  (print COMPRESSION LOST — range expanded)
+      Else: increment armPollCount each poll while still compressed
+        If ArmTimeout > 0 and armPollCount >= ArmTimeout: -> WATCHING  (print ARM TIMEOUT)
 
   Expansion check (only when ARMED):
     If currentRaw >= expansionThresh: ENTRY
@@ -152,7 +169,7 @@ Step 5 — Timeout
 ### PowerShell — common scenarios
 
 ```powershell
-# Default: 20-poll window, 3% compression, 1% expansion, 5% trail
+# Default: 20-poll window, 3% compression, 0.5% expansion (PS1), 5% trail
 .\compression-buy-any.ps1 -Chain base -Token speed -Amount 0.002
 
 # Tighter compression, faster expansion
@@ -204,41 +221,43 @@ chmod +x compression-buy-any.sh
 
 ## 6. Reading the Output
 
+(Default base token is **speed**; prices below are **base-token** return for `refTokenStr` ≈ **0.00000333 cbBTC** on Base — **~10³ speed**, matching `../LIVE-TEST-1000-SPEED.md`.)
+
 ### Warm-up phase
 
 ```
 [09:00:00] Warm-up 1/19 - waiting 60 s...
-[09:01:00] Price: 0.00042100 ETH  range: 4.12%  compress<=3%  [2 samples]
-[09:02:00] Price: 0.00042300 ETH  range: 3.87%  compress<=3%  [3 samples]
+[09:01:00] Price: 1008.20 speed  range: 4.12%  compress<=3%  [2 samples]
+[09:02:00] Price: 1005.40 speed  range: 3.87%  compress<=3%  [3 samples]
 ...
-[09:20:00] Price: 0.00041900 ETH  range: 2.94%  compress<=3%  [20 samples]
+[09:20:00] Price: 994.50 speed  range: 2.94%  compress<=3%  [20 samples]
 
-Warm-up complete. Range: 2.94%  Mean: 0.00042100 ETH  (20 polls)
+Warm-up complete. Range: 2.94%  Mean: 997.80 speed  (20 polls)
 ```
 
 ### Monitoring — watching state (not compressed yet)
 
 ```
-[09:21:00] [watching] price: 0.00043200  win-high: 0.00043500  range: 4.21%  exp-thresh: 0.00043935  (+0.0% vs high)
+[09:21:00] [watching] price: 1012.30 speed  win-high: 1018.60 speed  range: 4.21%  exp-thresh: 1028.79 speed  (+0.0% vs high)
 ```
 
 ### Monitoring — armed state (compressed)
 
 ```
-[09:22:00] COMPRESSION  range: 2.88% <= 3%  mean: 0.00042200 -- ARMED
-[09:23:00] [ARMED] price: 0.00042300  win-high: 0.00042500  range: 2.91%  exp-thresh: 0.00042925  (-0.47% vs high)
-[09:24:00] [ARMED] price: 0.00042500  win-high: 0.00042500  range: 2.89%  exp-thresh: 0.00042925  (+0.0% vs high)
-[09:25:00] [ARMED] price: 0.00042950  win-high: 0.00042500  range: 2.90%  exp-thresh: 0.00042925  (+1.06% vs high)
+[09:22:00] COMPRESSION  range: 2.88% <= 3%  mean: 998.20 speed -- ARMED
+[09:23:00] [ARMED] price: 999.40 speed  win-high: 1002.50 speed  range: 2.91%  exp-thresh: 1012.53 speed  (-0.47% vs high)
+[09:24:00] [ARMED] price: 1002.50 speed  win-high: 1002.50 speed  range: 2.89%  exp-thresh: 1012.53 speed  (+0.0% vs high)
+[09:25:00] [ARMED] price: 1013.20 speed  win-high: 1002.50 speed  range: 2.90%  exp-thresh: 1012.53 speed  (+1.07% vs high)
 
-EXPANSION BREAKOUT! Price 0.00042950 ETH >= 0.00042925 ETH while compressed  (+1.06% vs window high)
+EXPANSION BREAKOUT! Price 1013.20 speed >= 1012.53 speed while compressed  (+1.07% vs window high)
 ```
 
 ### Post-entry trailing stop
 
 ```
-[09:26:00] POST-ENTRY  0.00043200 ETH  peak: 0.00043200  floor: 0.00041040  (+0.0000% from peak)
-[09:27:00] POST-ENTRY  0.00044100 ETH  peak: 0.00044100  floor: 0.00041895  (+0.0000% from peak)
-[09:28:00] POST-ENTRY  0.00043200 ETH  peak: 0.00044100  floor: 0.00041895  (-2.0408% from peak)
+[09:26:00] POST-ENTRY  1018.00 speed  peak: 1018.00 speed  floor: 967.10 speed  (0.0000% from peak)
+[09:27:00] POST-ENTRY  1039.50 speed  peak: 1039.50 speed  floor: 987.53 speed  (0.0000% from peak)
+[09:28:00] POST-ENTRY  1015.20 speed  peak: 1039.50 speed  floor: 987.53 speed  (-2.3377% from peak)
 ```
 
 **Field meanings:**
@@ -246,7 +265,7 @@ EXPANSION BREAKOUT! Price 0.00042950 ETH >= 0.00042925 ETH while compressed  (+1
 - `[ARMED]` — range is compressed, next expansion breakout fires entry
 - `range: X%` — current rolling range as % of rolling mean
 - `exp-thresh` — the price level that fires entry (windowHigh * (1 + ExpansionPct/100))
-- `COMPRESSION LOST` — range expanded back above CompressionPct, arm reset
+- `COMPRESSION LOST` — range expanded back above `CompressionPct`, arm reset (PS1 also prints “range expanded beyond …%” in the same line)
 - `ARM TIMEOUT` — armed too long without breakout, arm reset
 
 ---
@@ -264,9 +283,9 @@ EXPANSION BREAKOUT! Price 0.00042950 ETH >= 0.00042925 ETH while compressed  (+1
 
 Lower values enter earlier on breakout (more reactive). Higher values wait for the breakout to be more confirmed (less false positives, worse entry price).
 
-- `0` — any tick above window high while armed fires entry
-- `0.5` — half a percent confirmation
-- `1` — 1% above window high (default)
+- `0` — any price at/above window high while armed fires entry (PS1 warns; Bash warns on stderr)
+- `0.5` — PowerShell **default**
+- `1` — Bash **default** (explicit `-ExpansionPct` on both runtimes avoids mismatch)
 - `2+` — conservative; may miss fast expansions
 
 **WindowPolls:**

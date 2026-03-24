@@ -61,7 +61,8 @@ Skill files use YAML frontmatter (`name`, `description`) and clear sections so a
 
 | Function          | Path                              | Description |
 |------------------|------------------------------------|-------------|
-| limit-order-any  | `scripts/limit-order-any/`         | Buy any token with ETH, poll, then sell when ETH return reaches target % (or after max iterations). Success = ETH in vs ETH out. |
+| limit-order-any  | `scripts/limit-order-any/`         | Buy any token with base token (default `speed`), poll, then sell when base-token return reaches target % (or after max iterations). |
+| market-watch-any | `scripts/market-watch-any/`        | Quote-only watcher: derive reference position from base spend, then poll target->base value with `% vs baseline` and session high/low. No swaps. |
 
 Add new rows as you add script folders. Keep the skill file in the same folder as the script.
 

@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Ladder sell: buy any token with ETH, then sell in N equal tranches at
+    Ladder sell: buy any token with -BaseToken, then sell in N equal tranches at
     predefined profit levels. Exits the position incrementally rather than
     all-at-once.
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes ETH -> <Token> to show what you will get.
-    3. Executes the buy (ETH -> <Token>).
+    2. Quotes BaseToken -> <Token> to show what you will get.
+    3. Executes the buy (BaseToken -> <Token>).
     4. Gets a baseline sell quote to anchor rung targets.
     5. Builds -Rungs sell levels spaced -RungSpacingPct% apart, starting at
        -FirstRungPct% gain. Each rung sells 1/Rungs of the original position.
@@ -21,10 +21,10 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    Prices and P/L are in -BaseToken units (default: speed).
 
 .PARAMETER Amount
-    ETH to spend on the initial buy.
+    Amount of -BaseToken to spend on the initial buy.
 
 .PARAMETER Rungs
     Number of sell levels. Each fires at an equal slice of the position.
@@ -52,13 +52,16 @@ param(
     [double]                       $FirstRungPct   = 25.0,
     [double]                       $RungSpacingPct = 25.0,
     [int]                          $PollSeconds    = 60,
-    [int]                          $MaxIterations  = 1440
+    [int]                          $MaxIterations  = 1440,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = '',
+    [switch]                       $DryRun
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -117,12 +120,24 @@ function Get-Quote {
     return $obj
 }
 
+function Get-QuoteBuyAmountScalar {
+    param($quoteObj)
+    $raw = $quoteObj.buyAmount
+    if ($null -eq $raw) { return 0.0 }
+    return [double](@($raw)[0])
+}
+
 function Invoke-RungSell {
     param([string]$tokenAmount, [int]$rungIndex, [double]$targetPct)
     Write-Host ""
-    Write-Host (">>> Rung {0} SELL (+{1}%): speed swap -c {2} --sell {3} --buy eth -a {4} -y" -f `
+    if ($script:DryRun) {
+        Write-Host (">>> [DRY-RUN] Rung {0} SELL (+{1}%): would run speed swap -c {2} --sell {3} --buy {4} -a {5} -y" -f `
+            $rungIndex, $targetPct, $Chain, $Token, $script:BaseLabel, $tokenAmount) -ForegroundColor Yellow
+        return
+    }
+    Write-Host (">>> Rung {0} SELL (+{1}%): speed swap -c {2} --sell {3} --buy $BaseToken -a {4} -y" -f `
         $rungIndex, $targetPct, $Chain, $Token, $tokenAmount) -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
     if ($LASTEXITCODE -ne 0) {
         throw "Sell swap failed (exit $LASTEXITCODE) for rung $rungIndex."
     }
@@ -133,8 +148,18 @@ function Invoke-RungSell {
 Write-Host ""
 Write-Host "Detecting token decimals..." -ForegroundColor DarkGray
 $tokenDecimals    = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
+$tokenDecimals    = [int](@($tokenDecimals)[0])
 $TOKEN_SCALE      = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel       = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
+
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$baseDecimals = [int](@($baseDecimals)[0])
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
+$script:DryRun = [bool]$DryRun
 
 # Validate parameters
 if ($Rungs -lt 1)          { Write-Error "-Rungs must be >= 1."; exit 1 }
@@ -151,20 +176,21 @@ Write-Host ""
 Write-Host "=== Speed Ladder Sell ===" -ForegroundColor Yellow
 Write-Host "  Chain         : $Chain"
 Write-Host "  Token         : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  ETH spent     : $Amount ETH"
+Write-Host "  Base spent    : $Amount $($script:BaseLabel)"
 Write-Host "  Rungs         : $Rungs  (sell 1/$Rungs of position per rung)"
-Write-Host "  Rung targets  : $($rungTargetPcts | ForEach-Object { "+$_%" } | Join-String -Separator ', ')"
+Write-Host "  Rung targets  : $([string]::Join(', ', ($rungTargetPcts | ForEach-Object { "+$_%" })))"
 Write-Host "  Poll interval : $PollSeconds s"
 Write-Host "  Max polls     : $MaxIterations"
+if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- no swaps will execute ***" -ForegroundColor Yellow }
 Write-Host ""
 
 # ── step 1: quote the buy ─────────────────────────────────────────────────────
 
-Write-Host "Step 1 - Quoting ETH -> $TokenLabel for $Amount ETH..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $($script:BaseLabel) -> $TokenLabel for $Amount $($script:BaseLabel)..." -ForegroundColor DarkCyan
 
-$buyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
-$tokenRaw   = [double]$buyQuote.buyAmount
-$tokenHuman = $tokenRaw / $TOKEN_SCALE
+$buyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
+$tokenRaw   = Get-QuoteBuyAmountScalar -quoteObj $buyQuote
+$tokenHuman = [double]$tokenRaw / [double]$TOKEN_SCALE
 $tokenStr   = $tokenHuman.ToString("F$tokenDecimals")
 
 if ([double]$tokenStr -le 0) {
@@ -172,56 +198,76 @@ if ([double]$tokenStr -le 0) {
     exit 1
 }
 
-Write-Host ("  You will get : {0} {1} for {2} ETH" -f $tokenStr, $TokenLabel, $Amount)
+Write-Host ("  You will get : {0} {1} for {2} {3}" -f $tokenStr, $TokenLabel, $Amount, $script:BaseLabel)
 Write-Host ""
 
 # ── step 2: execute the buy ───────────────────────────────────────────────────
 
-Write-Host "Step 2 - Buying $TokenLabel..." -ForegroundColor DarkCyan
-Write-Host ">>> Executing: speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor Cyan
-speed swap -c $Chain --sell eth --buy $Token -a $Amount -y
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Buy swap failed (exit $LASTEXITCODE). Aborting."
-    exit $LASTEXITCODE
+if ($DryRun) {
+    Write-Host "Step 2 - [DRY-RUN] Skipping buy; using Step 1 quote buy amount." -ForegroundColor DarkCyan
+    $tokenRaw   = Get-QuoteBuyAmountScalar -quoteObj $buyQuote
+    $tokenHuman = [double]$tokenRaw / [double]$TOKEN_SCALE
+    $tokenStr   = $tokenHuman.ToString("F$tokenDecimals")
+    if ([double]$tokenStr -le 0) {
+        Write-Error "Quote token amount resolved to 0 (raw=$tokenRaw). Aborting."
+        exit 1
+    }
+    Write-Host ""
+} else {
+    Write-Host "Step 2 - Buying $TokenLabel..." -ForegroundColor DarkCyan
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Buy swap failed (exit $LASTEXITCODE). Aborting."
+        exit $LASTEXITCODE
+    }
+    $tokenRaw = Get-QuoteBuyAmountScalar -quoteObj $buyQuote
+    $tokenHuman = [double]$tokenRaw / [double]$TOKEN_SCALE
+    $tokenStr   = $tokenHuman.ToString("F$tokenDecimals")
+    if ([double]$tokenStr -le 0) {
+        Write-Error "Quoted token amount is 0 (raw=$tokenRaw). Aborting."
+        exit 1
+    }
+    Write-Host ""
 }
-Write-Host ""
 
 # ── step 3: baseline sell quote — anchors rung targets ────────────────────────
 
-Write-Host "Step 3 - Baseline sell quote ($TokenLabel -> ETH)..." -ForegroundColor DarkCyan
+Write-Host "Step 3 - Baseline sell quote ($TokenLabel -> $($script:BaseLabel))..." -ForegroundColor DarkCyan
 
-$sellQuote   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
-$baselineRaw = [double]$sellQuote.buyAmount
-$baselineETH = $baselineRaw / $ETH_DECIMALS
+$sellQuote   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
+$baselineRaw = Get-QuoteBuyAmountScalar -quoteObj $sellQuote
+$baselineETH = [double]$baselineRaw / [double]$script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Baseline ETH back : {0:F8} ETH" -f $baselineETH)
+Write-Host ("  Baseline {1} back : {0:F8} {1}" -f $baselineETH, $script:BaseLabel)
 Write-Host ""
 
 # ── build rung objects ────────────────────────────────────────────────────────
 
-# Each rung sells an equal fraction of the original token amount
-$rungTokenHuman = $tokenHuman / $Rungs
-$rungTokenStr   = $rungTokenHuman.ToString("F$tokenDecimals")
+# Each rung sells floor(tokenRaw/Rungs) except the last, which sells the remainder (no stranded dust)
+$rungTokenRaw = [Math]::Floor([double]$tokenRaw / [double]$Rungs)
+$rungHuman    = [double]$rungTokenRaw / [double]$TOKEN_SCALE
+$rungTokenStr = $rungHuman.ToString("F$tokenDecimals")
+$lastRungTokenRaw = [double]$tokenRaw - ([double]$rungTokenRaw * ([double]$Rungs - 1))
+$lastRungHuman    = $lastRungTokenRaw / [double]$TOKEN_SCALE
+$lastRungTokenStr = $lastRungHuman.ToString("F$tokenDecimals")
+
+# If tokenRaw is exactly divisible by Rungs, remainder raw is 0 — last rung must not sell "nothing"
+if ([double]$lastRungTokenStr -le 0) { $lastRungTokenStr = $rungTokenStr }
 
 if ([double]$rungTokenStr -le 0) {
     Write-Error "Rung token amount resolved to 0 (tokenStr=$tokenStr, Rungs=$Rungs). Aborting."
     exit 1
 }
 
-$rungs = @()
+$rungList = @()
 for ($i = 0; $i -lt $Rungs; $i++) {
-    $pct        = $rungTargetPcts[$i]
-    $targetRaw  = $baselineRaw * (1.0 + $pct / 100.0)
-    $targetETH  = $targetRaw / $ETH_DECIMALS
-    $rungs += [PSCustomObject]@{
-        Index     = $i
-        TargetPct = $pct
-        TargetRaw = $targetRaw
-        TargetETH = $targetETH
-        Sold      = $false
-    }
-    Write-Host ("  Rung {0}: sell 1/{1} of position at +{2}%  (target: {3:F8} ETH for full position)" -f `
-        $i, $Rungs, $pct, $targetETH) -ForegroundColor DarkGray
+    $pct        = [double]$rungTargetPcts[$i]
+    $targetRaw  = [double]$baselineRaw * (1.0 + $pct / 100.0)
+    $targetETH  = [double]$targetRaw / $script:BASE_DECIMALS_SCALE
+    $trancheStr = if ($i -eq ($Rungs - 1)) { $lastRungTokenStr } else { $rungTokenStr }
+    $rungList += [PSCustomObject]@{ Index = $i; TargetPct = $pct; TargetRaw = $targetRaw; TargetETH = $targetETH; SellStr = $trancheStr; Sold = $false }
+    Write-Host ("  Rung {0}: sell 1/{1} of position at +{2}%  (target: {3:F8} {4} for full position)" -f $i, $Rungs, $pct, $targetETH, $script:BaseLabel) -ForegroundColor DarkGray
 }
 Write-Host ""
 
@@ -244,14 +290,14 @@ while ($iteration -lt $MaxIterations) {
 
     try {
         # Quote full position as price oracle
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
-        $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
+        $currentRaw = Get-QuoteBuyAmountScalar -quoteObj $q
+        $currentETH = [double]$currentRaw / [double]$script:BASE_DECIMALS_SCALE
         $pctVsBase  = (($currentRaw - $baselineRaw) / $baselineRaw) * 100.0
         $ts2        = Get-Date -Format "HH:mm:ss"
 
         # Determine color: above highest unfired rung target = green, near first target = yellow
-        $nextRung = $rungs | Where-Object { -not $_.Sold } | Sort-Object TargetRaw | Select-Object -First 1
+        $nextRung = $rungList | Where-Object { -not $_.Sold } | Sort-Object TargetRaw | Select-Object -First 1
         if ($null -eq $nextRung) {
             $color = "Green"
         } elseif ($currentRaw -ge $nextRung.TargetRaw) {
@@ -263,21 +309,21 @@ while ($iteration -lt $MaxIterations) {
         }
 
         $soldStatus = "($soldRungs/$Rungs sold)"
-        Write-Host ("[$ts2] Full pos: {0:F8} ETH  ({1:+0.0000}% vs baseline)  {2}" -f $currentETH, $pctVsBase, $soldStatus) -ForegroundColor $color
+        Write-Host ("[$ts2] Full pos: {0:F8} {3}  ({1:F4}% vs baseline)  {2}" -f $currentETH, $pctVsBase, $soldStatus, $script:BaseLabel) -ForegroundColor $color
 
         # Process rungs in order (lowest target first)
-        foreach ($rung in ($rungs | Sort-Object TargetRaw)) {
+        foreach ($rung in ($rungList | Sort-Object TargetRaw)) {
             if ($rung.Sold) { continue }
             if ($currentRaw -ge $rung.TargetRaw) {
                 $gainPct = (($currentRaw - $baselineRaw) / $baselineRaw) * 100.0
                 Write-Host ""
-                Write-Host ("Rung {0} target hit! +{1:F4}% gain. Selling 1/{2} of position ({3} {4})..." -f `
-                    $rung.Index, $gainPct, $Rungs, $rungTokenStr, $TokenLabel) -ForegroundColor Green
+                Write-Host ("Rung {0} target hit! +{1:F4}% gain. Selling tranche ({2} {3})..." -f $rung.Index, $gainPct, $rung.SellStr, $TokenLabel) -ForegroundColor Green
                 try {
-                    Invoke-RungSell -tokenAmount $rungTokenStr -rungIndex $rung.Index -targetPct $rung.TargetPct
+                    Invoke-RungSell -tokenAmount $rung.SellStr -rungIndex $rung.Index -targetPct $rung.TargetPct
                     $rung.Sold    = $true
                     $soldRungs++
-                    $totalEthBack += $rungTokenStr * ($baselineRaw / $tokenHuman / $ETH_DECIMALS)  # approximate
+                    $soldHuman     = [double]$rung.SellStr
+                    $totalEthBack += $soldHuman * ([double]$baselineRaw / [double]$tokenHuman / [double]$script:BASE_DECIMALS_SCALE)  # approximate
                     Write-Host ("  Rung {0} sold. {1}/{2} rungs complete." -f $rung.Index, $soldRungs, $Rungs) -ForegroundColor DarkGray
                     Write-Host ""
                 } catch {
@@ -300,16 +346,16 @@ while ($iteration -lt $MaxIterations) {
 
 # ── max iterations: sell remaining tokens ─────────────────────────────────────
 
-$remainingRungs = $rungs | Where-Object { -not $_.Sold }
+$remainingRungs = $rungList | Where-Object { -not $_.Sold }
 $remainingCount = ($remainingRungs | Measure-Object).Count
 
 Write-Host ""
 Write-Host "Max iterations ($MaxIterations) reached. Selling $remainingCount remaining rung(s)..." -ForegroundColor Yellow
 
 foreach ($rung in $remainingRungs) {
-    Write-Host ("  Selling rung {0}: {1} {2}" -f $rung.Index, $rungTokenStr, $TokenLabel) -ForegroundColor Cyan
+    Write-Host ("  Selling rung {0}: {1} {2}" -f $rung.Index, $rung.SellStr, $TokenLabel) -ForegroundColor Cyan
     try {
-        Invoke-RungSell -tokenAmount $rungTokenStr -rungIndex $rung.Index -targetPct $rung.TargetPct
+        Invoke-RungSell -tokenAmount $rung.SellStr -rungIndex $rung.Index -targetPct $rung.TargetPct
         $rung.Sold = $true
         $soldRungs++
     } catch {

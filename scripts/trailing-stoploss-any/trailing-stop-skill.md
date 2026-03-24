@@ -1,83 +1,123 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+`-Amount` is in **units of the base token** you spend on the initial buy. Use `../scripts/` if you want ETH-only bots unchanged.
+
 ---
-name: trailing-stop-any
-description: Runs the trailing stop-loss flow: buy any token with ETH via speed CLI, poll Token->ETH, sell when ETH return drops TrailPct% below the running peak. Use when automating trailing stop-loss, buy-then-sell with a trailing floor, or when the user refers to trailing-stop-any.ps1/.sh or "trailing stop" with ETH/token.
+
+# Trailing Stop-Loss Skill
+
+Complete reference for `trailing-stop-any.ps1` and `trailing-stop-any.sh` — buy the asset with base token, then sell when **base-token return** for the position drops **TrailPct%** below the **running peak**. The floor moves up with new highs and never ratchets down.
+
 ---
 
-# Trailing Stop-Loss (ETH → Token → ETH)
+## Table of Contents
 
-Scripts: `trailing-stop-any.ps1` (PowerShell), `trailing-stop-any.sh` (Bash). Buy with ETH, then sell when the **ETH return** drops **TrailPct%** below the **running peak**. The floor trails the peak upward and never moves down.
+1. [Concept](#1-concept)
+2. [Parameters Reference](#2-parameters-reference)
+3. [Flow](#3-flow)
+4. [Running the Scripts](#4-running-the-scripts)
+5. [Reading the Output](#5-reading-the-output)
+6. [Helpers (internals)](#6-helpers-internals)
+7. [Agent Notes](#7-agent-notes)
 
-## When to use
+---
 
-- User wants to run or modify the trailing stop-loss flow (buy token with ETH, sell when value drops TrailPct% below the highest seen).
-- User asks about `trailing-stop-any.ps1`, `trailing-stop-any.sh`, "trailing stop", or "trailing stop-loss" with ETH.
-- User needs parameter or flow documentation for these scripts.
+## 1. Concept
 
-## Flow (do not reorder)
+After entry, every poll quotes **Token → BaseToken** for the fixed position size. **Peak** is the highest base return seen; **floor** = peak × (1 − TrailPct/100). When current ≤ floor, the script sells the full position.
 
-1. **Resolve token decimals**  
-   On-chain RPC `decimals()` for token address; aliases (e.g. `speed`) and non-0x inputs default to 18.
+**When to use it:**
+- You want to ride upside but cap give-back from the top
+- You are fine exiting on a timeout forced sell if the trail never breaks
 
-2. **Quote buy**  
-   `speed quote --json` ETH → Token for `-Amount` / `--amount` ETH. Derive token amount (human-readable) and validate &gt; 0.
+Peak and floor are tracked in **raw** integer units; display uses the base token’s decimals.
 
-3. **Execute buy**  
-   `speed swap -c $Chain --sell eth --buy $Token -a $Amount -y`. Exit on failure.
+---
 
-4. **Baseline sell quote → initial peak and floor**  
-   Quote Token → ETH for the token amount from step 2. Set **peak** = baseline ETH (raw wei). Set **floor** = peak × (1 − TrailPct/100). Floor and peak are in raw wei for comparisons.
+## 2. Parameters Reference
 
-5. **Poll until floor breach or max iterations**  
-   Every `-PollSeconds` / `--pollseconds`: quote Token → ETH.
-   - If **current &gt; peak**: set peak = current, floor = peak × (1 − TrailPct/100). (Floor only ever rises.)
-   - If **current ≤ floor**: sell immediately and exit.
-   - Otherwise continue polling.
-   If `-MaxIterations` / `--maxiterations` reached without selling, sell anyway and exit.
+| Parameter (PS1)    | Flag (SH)            | Type    | Default  | Description |
+|---|---|---|---|---|
+| `-Chain`           | `--chain`            | string  | required | Chain name or ID. |
+| `-Token`           | `--token`            | string  | required | Token contract address or alias. |
+| `-Amount`          | `--amount`           | string  | required | **Base token** to spend on the buy. |
+| `-TrailPct`        | `--trailpct`         | float   | required | % drop from **peak** base return that triggers sell. |
+| `-TokenSymbol`     | `--tokensymbol`      | string  | `""`     | Optional display label for the token. |
+| `-PollSeconds`     | `--pollseconds`      | integer | `60`     | Seconds between quotes. |
+| `-MaxIterations`   | `--maxiterations`    | integer | `1440`   | Max polls; then **forced sell** if not already sold. |
+| `-BaseToken`       | `--base-token`       | string  | `speed`  | Quote asset (`speed`, `eth`, …). If same as `-Token`, script resolves to `eth`. |
+| `-BaseTokenSymbol` | `--base-token-symbol` | string | *(empty)* | Label for base in logs. |
+| `-DryRun`          | `--dry-run`          | switch  | off      | No swaps; logs peak/floor logic only. |
 
-6. **Sell**  
-   `speed swap -c $Chain --sell $Token --buy eth -a $tokenStr -y`. Script exits after this.
+---
 
-## Parameters
+## 3. Flow
 
-| Parameter        | Required | PowerShell           | Bash                 | Meaning |
-|------------------|----------|----------------------|----------------------|--------|
-| Chain            | Yes      | `-Chain`             | `--chain`            | Chain name or id: base, mainnet/ethereum/1, optimism/10, arbitrum/42161, polygon/137, bsc/56 |
-| Token            | Yes      | `-Token`             | `--token`            | Token contract address (0x...) or alias (e.g. `speed`) |
-| Amount           | Yes      | `-Amount`            | `--amount`           | ETH amount to spend (e.g. "0.001") |
-| TrailPct         | Yes      | `-TrailPct`          | `--trailpct`         | % drop from peak that triggers sell (e.g. 5 = sell when value is 5% below peak) |
-| TokenSymbol      | No       | `-TokenSymbol`       | `--tokensymbol`      | Display label (default: token address or alias) |
-| PollSeconds      | No       | `-PollSeconds`       | `--pollseconds`      | Seconds between sell quotes (default: 60) |
-| MaxIterations    | No       | `-MaxIterations`     | `--maxiterations`    | Max poll count before forced sell (default: 1440) |
+1. Resolve token decimals.
+2. Quote **BaseToken → Token** for `-Amount`.
+3. **Buy:** `speed swap --sell <BaseToken> --buy <Token> -a <Amount> -y`.
+4. **Baseline:** Quote **Token → BaseToken** for the position size; set **peak** = that return; **floor** = peak × (1 − TrailPct/100).
+5. **Poll:** Each interval, quote **Token → BaseToken** for the same token amount.  
+   - If current **>** peak → peak = current, recompute floor.  
+   - If current **≤** floor → sell and exit.  
+   - If **MaxIterations** → sell and exit.
+6. **Sell:** `speed swap --sell <Token> --buy <BaseToken> -a <tokenAmount> -y`.
 
-## Helpers (script internals)
+---
 
-- **Get token decimals**: RPC `eth_call` to token `decimals()`; aliases/non-0x → 18.
-- **Get-Quote / get_quote**: `speed quote --json`; parse first JSON line; require `buyAmount`.
-- **Run-Sell / run_sell**: Runs `speed swap` Token → ETH with given token amount, then exits.
-- **Peak/floor**: Stored in raw wei; floor = peak × (1 − TrailPct/100); peak (and thus floor) only increase when a new high is seen.
-
-## Examples
+## 4. Running the Scripts
 
 **PowerShell:**
+
 ```powershell
 .\trailing-stop-any.ps1 -Chain base -Token speed -Amount 0.001 -TrailPct 5
 .\trailing-stop-any.ps1 -Chain base -Token 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf -TokenSymbol cbBTC -Amount 0.002 -TrailPct 3
-.\trailing-stop-any.ps1 -Chain base -Token 0x... -TokenSymbol PEPE -Amount 0.01 -TrailPct 10 -PollSeconds 30
+.\trailing-stop-any.ps1 -Chain base -Token speed -Amount 0.001 -TrailPct 5 -DryRun
 ```
 
-**Bash:**
+**Bash** (`--trailpct` is one word, matching the script):
+
 ```bash
 ./trailing-stop-any.sh --chain base --token speed --amount 0.001 --trailpct 5
 ./trailing-stop-any.sh --chain base --token 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf --tokensymbol cbBTC --amount 0.002 --trailpct 3
-./trailing-stop-any.sh --chain base --token 0x... --tokensymbol PEPE --amount 0.01 --trailpct 10 --pollseconds 30
+./trailing-stop-any.sh --chain base --token speed --amount 0.001 --trailpct 5 --dry-run
+chmod +x trailing-stop-any.sh
 ```
 
-## RPC / chains
+---
 
-Scripts use built-in RPC URLs for decimals only (Base, Ethereum, Optimism, Arbitrum, Polygon, BSC). Swap execution is via `speed` CLI.
+## 5. Reading the Output
 
-## Agent guidance
+With **`-Amount 1000` speed**, **cbBTC**, and **`-TrailPct 5`**, a dry-run window in `../LIVE-TEST-1000-SPEED.md` showed **peak ~995.55 speed** and **floor ~945.78 speed** for the **~0.00000333 cbBTC** position — again **~10³ speed** oracle lines.
 
-- **Modifying the script**: Preserve the order of steps (quote buy → buy → baseline peak/floor → poll → sell). Do not sell before the buy succeeds. Keep peak/floor logic: floor = peak × (1 − TrailPct/100); floor only updates when peak updates (on new high).
-- **Adding features**: Keep all comparisons in raw wei for consistency; convert to human ETH only for display.
-- **Debugging**: Failures are usually from `speed quote`/`speed swap` or RPC; scripts use strict error handling and exit on buy failure.
+Illustrative polls:
+
+```
+[22:57:10] Poll 3/1440  current: 995.55 speed  peak: 995.55 speed  floor: 945.77 speed  (trail 5.0%)
+[22:58:10] Poll 4/1440  current: 1012.30 speed  peak: 1012.30 speed  floor: 961.69 speed  (new peak)
+[22:59:10] Poll 5/1440  current: 942.00 speed  peak: 1012.30 speed  floor: 961.69 speed  — TRAIL EXIT
+>>> Executing: speed swap -c base --sell 0xcbB7... --buy speed -a 0.00000333 -y
+```
+
+---
+
+## 6. Helpers (internals)
+
+- Decimals via RPC for `0x` tokens; aliases treated as 18 where applicable.
+- Quotes: `speed quote --json`; **peak/floor** comparisons use **raw** scaled integers.
+- Sell helper runs `speed swap` Token → BaseToken then exits.
+
+---
+
+## 7. Agent Notes
+
+- Do not sell before a successful buy.
+- Floor only updates when **peak** updates (on a strictly higher base return).
+- **Debugging:** typical failures are `speed quote` / `speed swap` or RPC connectivity.

@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes -Amount ETH -> <Token> to establish a reference amount.
+    2. Quotes -Amount of -BaseToken -> <Token> to establish a reference amount.
     3. Gets initial price quote to seed the baseline window.
     4. Detection loop: polls every -PollSeconds seconds.
        - Computes baseline = mean of the last -BaselinePolls prices.
@@ -13,7 +13,7 @@
        - If dropPct >= CrashPct: crash confirmed -> executes the buy.
        - Otherwise: slides the window forward, continue watching.
     5. Post-buy: trailing stop (identical to trailing-stop-any.ps1).
-       Peak rises on new highs. Sells when ETH return drops -TrailPct% from peak.
+       Peak rises on new highs. Sells when base return drops -TrailPct% from peak.
     6. Falls back to selling after -MaxIterations total polls.
 
     BaselinePolls controls false-positive resistance. Default 1 = single-poll
@@ -31,10 +31,10 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    Amounts and P/L are in -BaseToken (default: speed).
 
 .PARAMETER Amount
-    ETH to spend when a crash is confirmed.
+    Amount of -BaseToken to spend when a crash is confirmed.
 
 .PARAMETER CrashPct
     % drop below the rolling baseline required to trigger the buy.
@@ -76,13 +76,15 @@ param(
     [int]     $PollSeconds      = 30,
     [int]     $MaxIterations    = 2880,
     [int]     $TimeStopMinutes  = 0,
-    [switch]  $DryRun
+    [switch]  $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -144,8 +146,8 @@ function Get-Quote {
 function Run-Sell {
     param([string]$tokenAmount)
     Write-Host ""
-    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y" -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
     exit $LASTEXITCODE
 }
 
@@ -157,9 +159,16 @@ $tokenDecimals = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
 $TOKEN_SCALE   = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel    = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
 if ($CrashPct -le 0)        { Write-Error "-CrashPct must be > 0."; exit 1 }
 if ($TrailPct -le 0)        { Write-Error "-TrailPct must be > 0."; exit 1 }
 if ($BaselinePolls -lt 1)   { Write-Error "-BaselinePolls must be >= 1."; exit 1 }
+if ($MaxIterations -le $BaselinePolls) { Write-Error "-MaxIterations must be > -BaselinePolls."; exit 1 }
 if ($TimeStopMinutes -lt 0) { Write-Error "-TimeStopMinutes must be >= 0."; exit 1 }
 
 Write-Host ""
@@ -167,7 +176,7 @@ Write-Host "=== Speed Crash Buy ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- crash signals logged, no buy will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain          : $Chain"
 Write-Host "  Token          : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  Buy amount     : $Amount ETH  (on crash)"
+Write-Host "  Buy amount     : $Amount $($script:BaseLabel)  (on crash)"
 $baselineLabel = if ($BaselinePolls -eq 1) { "single-poll (prev tick)" } else { "$BaselinePolls-poll rolling mean" }
 Write-Host "  Crash trigger  : $CrashPct % drop vs $baselineLabel"
 Write-Host "  Baseline polls : $BaselinePolls  (window warm-up: $BaselinePolls polls)"
@@ -181,9 +190,9 @@ Write-Host ""
 
 # -- step 1: reference quote (no buy yet) --------------------------------------
 
-Write-Host "Step 1 - Quoting $Amount ETH -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $Amount $($script:BaseLabel) -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
 
-$refBuyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
+$refBuyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
 $refTokenRaw   = [double]$refBuyQuote.buyAmount
 $refTokenHuman = $refTokenRaw / $TOKEN_SCALE
 $refTokenStr   = $refTokenHuman.ToString("F$tokenDecimals")
@@ -192,18 +201,18 @@ if ([double]$refTokenStr -le 0) {
     Write-Error "Reference token amount resolved to 0 (raw=$refTokenRaw, decimals=$tokenDecimals). Aborting."
     exit 1
 }
-Write-Host ("  Reference amount : {0} {1} for {2} ETH" -f $refTokenStr, $TokenLabel, $Amount)
+Write-Host ("  Reference amount : {0} {1} for {2} {3}" -f $refTokenStr, $TokenLabel, $Amount, $script:BaseLabel)
 
 # -- step 2: initial price quote -----------------------------------------------
 
 Write-Host ""
 Write-Host "Step 2 - Getting initial price..." -ForegroundColor DarkCyan
 
-$initSellQuote = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+$initSellQuote = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
 $prevRaw       = [double]$initSellQuote.buyAmount
-$prevETH       = $prevRaw / $ETH_DECIMALS
+$prevETH       = $prevRaw / $script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Initial price : {0:F8} ETH  (for {1} {2})" -f $prevETH, $refTokenStr, $TokenLabel)
+Write-Host ("  Initial price : {0:F8} {3}  (for {1} {2})" -f $prevETH, $refTokenStr, $TokenLabel, $script:BaseLabel)
 Write-Host ""
 
 # -- step 3: crash detection + post-entry trailing stop ------------------------
@@ -213,6 +222,7 @@ Write-Host ""
 
 $iteration    = 0
 $entryMade    = $false
+$dryRunCrashSeen = $false
 $tokenStr     = ""
 $peakRaw      = [double]0
 $floorRaw     = [double]0
@@ -245,24 +255,24 @@ while ($iteration -lt $MaxIterations) {
     }
 
     try {
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $currentETH = $currentRaw / $script:BASE_DECIMALS_SCALE
         $ts2        = Get-Date -Format "HH:mm:ss"
 
         # ── post-entry: trailing stop ──────────────────────────────────────────
         if ($entryMade) {
-            $tq   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+            $tq   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
             $tRaw = [double]$tq.buyAmount
-            $tETH = $tRaw / $ETH_DECIMALS
+            $tETH = $tRaw / $script:BASE_DECIMALS_SCALE
 
             if ($tRaw -gt $peakRaw) {
                 $peakRaw  = $tRaw
                 $floorRaw = $peakRaw * (1.0 - $TrailPct / 100.0)
             }
 
-            $peakETH     = $peakRaw / $ETH_DECIMALS
-            $floorETH    = $floorRaw / $ETH_DECIMALS
+            $peakETH     = $peakRaw / $script:BASE_DECIMALS_SCALE
+            $floorETH    = $floorRaw / $script:BASE_DECIMALS_SCALE
             $pctFromPeak = (($tRaw - $peakRaw) / $peakRaw) * 100.0
 
             $trailDist   = $peakRaw - $floorRaw
@@ -275,13 +285,13 @@ while ($iteration -lt $MaxIterations) {
                 $color = "White"
             }
 
-            Write-Host ("[$ts2] POST-ENTRY  {0:F8} ETH  peak: {1:F8}  floor: {2:F8}  ({3:F4}% from peak)" -f `
-                $tETH, $peakETH, $floorETH, $pctFromPeak) -ForegroundColor $color
+            Write-Host ("[$ts2] POST-ENTRY  {0:F8} {4}  peak: {1:F8} {4}  floor: {2:F8} {4}  ({3:F4}% from peak)" -f `
+                $tETH, $peakETH, $floorETH, $pctFromPeak, $script:BaseLabel) -ForegroundColor $color
 
             if ($tRaw -le $floorRaw) {
                 $gainPct = (($tETH - [double]$Amount) / [double]$Amount) * 100.0
                 Write-Host ""
-                Write-Host ("Trail floor breached! {0:F8} ETH back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct) -ForegroundColor Red
+                Write-Host ("Trail floor breached! {0:F8} {2} back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct, $script:BaseLabel) -ForegroundColor Red
                 Run-Sell $tokenStr
             }
             continue
@@ -299,7 +309,7 @@ while ($iteration -lt $MaxIterations) {
         $windowArr   = $priceWindow.ToArray()
         $baselineArr = $windowArr[0..($windowArr.Length - 2)]
         $baselineRaw = ($baselineArr | Measure-Object -Sum).Sum / $baselineArr.Length
-        $baselineETH = $baselineRaw / $ETH_DECIMALS
+        $baselineETH = $baselineRaw / $script:BASE_DECIMALS_SCALE
         $dropPct     = if ($baselineRaw -gt 0) { (($baselineRaw - $currentRaw) / $baselineRaw) * 100.0 } else { 0.0 }
         $pctToTrig   = $CrashPct - $dropPct
 
@@ -318,39 +328,43 @@ while ($iteration -lt $MaxIterations) {
             $color = "DarkGray"
         }
 
-        Write-Host ("[$ts2] Price: {0:F8} ETH  baseline: {1:F8}  drop: {2:+0.4f}%  trigger: {3:F2}%  ({4:+0.4f}% away)" -f `
-            $currentETH, $baselineETH, $dropPct, $CrashPct, (-$pctToTrig)) -ForegroundColor $color
+        Write-Host ("[$ts2] Price: {0:F8} {5}  baseline: {1:F8} {5}  drop: {2:F4}%  trigger: {3:F2}%  ({4:F4}% away)" -f `
+            $currentETH, $baselineETH, $dropPct, $CrashPct, (-$pctToTrig), $script:BaseLabel) -ForegroundColor $color
 
         # Crash entry condition
         if ($dropPct -ge $CrashPct) {
             Write-Host ""
-            Write-Host ("CRASH detected! Price dropped {0:F4}% vs {1}-poll baseline  ({2:F8} ETH -> {3:F8} ETH)" -f `
-                $dropPct, $BaselinePolls, $baselineETH, $currentETH) -ForegroundColor Green
+            Write-Host ("CRASH detected! Price dropped {0:F4}% vs {1}-poll baseline  ({2:F8} {4} -> {3:F8} {4})" -f `
+                $dropPct, $BaselinePolls, $baselineETH, $currentETH, $script:BaseLabel) -ForegroundColor Green
 
             if ($DryRun) {
-                Write-Host "  [DRY-RUN] Would BUY $Amount ETH of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                Write-Host "  [DRY-RUN] Would BUY $Amount $($script:BaseLabel) of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                $dryRunCrashSeen = $true
             } else {
                 Write-Host ""
-                Write-Host "Executing crash buy: $Amount ETH -> $TokenLabel" -ForegroundColor Green
-                Write-Host ">>> speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor Cyan
-                speed swap -c $Chain --sell eth --buy $Token -a $Amount -y
+                Write-Host "Executing crash buy: $Amount $($script:BaseLabel) -> $TokenLabel" -ForegroundColor Green
+                Write-Host ">>> speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor Cyan
+                speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y
                 if ($LASTEXITCODE -ne 0) {
                     Write-Error "Crash buy failed (exit $LASTEXITCODE). Aborting."
                     exit $LASTEXITCODE
                 }
+                $actTokenRaw = $refTokenRaw
+                $actTokenHuman = $actTokenRaw / $TOKEN_SCALE
+                $refTokenStr   = $actTokenHuman.ToString("F$tokenDecimals")
                 Write-Host ""
 
                 Write-Host "Getting post-buy sell quote to anchor trailing stop..." -ForegroundColor DarkCyan
-                $postBuyQ   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+                $postBuyQ   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
                 $postBuyRaw = [double]$postBuyQ.buyAmount
                 $tokenStr   = $refTokenStr
                 $peakRaw    = $postBuyRaw
                 $floorRaw   = $peakRaw * (1.0 - $TrailPct / 100.0)
                 $entryMade  = $true
 
-                Write-Host ("  Entry price  : {0:F8} ETH  (for {1} {2})" -f ($postBuyRaw / $ETH_DECIMALS), $tokenStr, $TokenLabel) -ForegroundColor DarkGray
-                Write-Host ("  Trail peak   : {0:F8} ETH" -f ($peakRaw / $ETH_DECIMALS)) -ForegroundColor DarkGray
-                Write-Host ("  Trail floor  : {0:F8} ETH  (-{1}%)" -f ($floorRaw / $ETH_DECIMALS), $TrailPct) -ForegroundColor DarkGray
+                Write-Host ("  Entry price  : {0:F8} {3}  (for {1} {2})" -f ($postBuyRaw / $script:BASE_DECIMALS_SCALE), $tokenStr, $TokenLabel, $script:BaseLabel) -ForegroundColor DarkGray
+                Write-Host ("  Trail peak   : {0:F8} {1}" -f ($peakRaw / $script:BASE_DECIMALS_SCALE), $script:BaseLabel) -ForegroundColor DarkGray
+                Write-Host ("  Trail floor  : {0:F8} {2}  (-{1}%)" -f ($floorRaw / $script:BASE_DECIMALS_SCALE), $TrailPct, $script:BaseLabel) -ForegroundColor DarkGray
                 Write-Host ""
             }
         }
@@ -366,6 +380,9 @@ Write-Host ""
 if ($entryMade) {
     Write-Host "Max iterations ($MaxIterations) reached. Selling position..." -ForegroundColor Yellow
     Run-Sell $tokenStr
+} elseif ($DryRun -and $dryRunCrashSeen) {
+    Write-Host "Max iterations ($MaxIterations) reached. Dry-run logged crash signal(s); no on-chain trade." -ForegroundColor Yellow
+    exit 0
 } else {
     Write-Host "Max iterations ($MaxIterations) reached. No crash detected. Exiting without a trade." -ForegroundColor Yellow
     exit 0

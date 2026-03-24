@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes -EthPerGrid ETH -> <Token> to determine refTokenAmount and establish
-       basePrice (Token -> ETH quote for that reference amount).
+    2. Quotes -BasePerGrid of -BaseToken -> <Token> to determine refTokenAmount and establish
+       basePrice (Token -> BaseToken quote for that reference amount).
     3. Builds -Levels grid cells below current price, spaced -GridPct % apart.
        Cell i:  BuyLevel  = basePrice * (1 - (i+1) * GridPct/100)
                 SellLevel = basePrice * (1 - i     * GridPct/100)
@@ -24,10 +24,10 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH is always the quote currency.
+    Grid P&L is measured in -BaseToken (default: speed).
 
-.PARAMETER EthPerGrid
-    ETH to spend at each buy level (min ~0.0001 ETH to avoid 0x dust rejection).
+.PARAMETER BasePerGrid
+    Amount of -BaseToken to spend at each buy level (min ~0.0001 base units to avoid dust rejection).
 
 .PARAMETER Levels
     Number of grid cells to create below current price.
@@ -48,27 +48,28 @@
     Print what would happen without executing any swaps.
 
 .EXAMPLE
-    .\grid-trade-any.ps1 -Chain base -Token speed -EthPerGrid 0.001 -Levels 5 -GridPct 2
-    .\grid-trade-any.ps1 -Chain base -Token 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf -TokenSymbol cbBTC -EthPerGrid 0.002 -Levels 3 -GridPct 1.5 -PollSeconds 30
-    .\grid-trade-any.ps1 -Chain base -Token speed -EthPerGrid 0.001 -Levels 4 -GridPct 2 -DryRun
+    .\grid-trade-any.ps1 -Chain base -Token speed -BasePerGrid 0.001 -Levels 5 -GridPct 2
+    .\grid-trade-any.ps1 -Chain base -Token 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf -TokenSymbol cbBTC -BasePerGrid 0.002 -Levels 3 -GridPct 1.5 -PollSeconds 30
+    .\grid-trade-any.ps1 -Chain base -Token speed -BasePerGrid 0.001 -Levels 4 -GridPct 2 -DryRun
 #>
 
 param(
     [Parameter(Mandatory)][string] $Chain,
     [Parameter(Mandatory)][string] $Token,
-    [Parameter(Mandatory)][string] $EthPerGrid,
+    [Parameter(Mandatory)][string] $BasePerGrid,
     [Parameter(Mandatory)][int]    $Levels,
     [Parameter(Mandatory)][double] $GridPct,
     [string]                       $TokenSymbol   = "",
     [int]                          $PollSeconds   = 60,
     [int]                          $MaxIterations = 2880,
-    [switch]                       $DryRun
+    [switch]                       $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -138,7 +139,7 @@ function Invoke-Buy {
     # Returns the quoted token amount string (used as cell's held balance).
     param([string]$ethAmount, [int]$cellIndex)
 
-    $q          = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $ethAmount
+    $q          = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $ethAmount
     $tokenRaw   = [double]$q.buyAmount
     $tokenHuman = $tokenRaw / $script:TOKEN_DECIMALS_SCALE
     $tokenStr   = $tokenHuman.ToString("F$script:tokenDecimals")
@@ -146,14 +147,11 @@ function Invoke-Buy {
     if ([double]$tokenStr -le 0) { throw "Token amount resolved to 0 for cell $cellIndex." }
 
     if ($DryRun) {
-        Write-Host ("  [DRY-RUN] Cell {0}: would BUY {1} {2} for {3} ETH" -f $cellIndex, $tokenStr, $script:TokenLabel, $ethAmount) -ForegroundColor DarkYellow
+        Write-Host ("  [DRY-RUN] Cell {0}: would BUY {1} {2} for {3} {4}" -f $cellIndex, $tokenStr, $script:TokenLabel, $ethAmount, $script:BaseLabel) -ForegroundColor DarkYellow
     } else {
-        Write-Host ("  >>> Cell {0} BUY: speed swap -c {1} --sell eth --buy {2} -a {3} -y" -f $cellIndex, $Chain, $Token, $ethAmount) -ForegroundColor Cyan
-        $raw  = speed --json --yes swap -c $Chain --sell eth --buy $Token -a $ethAmount 2>&1
-        $line = $raw | Where-Object { $_ -match '^\{' } | Select-Object -First 1
-        $res  = $line | ConvertFrom-Json
-        if ($res.PSObject.Properties.Name -contains 'error') { throw "Buy swap failed: $($res.error)" }
-        Write-Host ("  TX: {0}" -f $res.txHash) -ForegroundColor DarkGray
+        Write-Host ("  >>> Cell {0} BUY: speed swap -c {1} --sell $BaseToken --buy {2} -a {3} -y" -f $cellIndex, $Chain, $Token, $ethAmount) -ForegroundColor Cyan
+        speed swap -c $Chain --sell $BaseToken --buy $Token -a $ethAmount -y
+        if ($LASTEXITCODE -ne 0) { throw "Buy swap failed (exit $LASTEXITCODE)." }
     }
 
     $script:totalEthSpent += [double]$ethAmount
@@ -162,33 +160,27 @@ function Invoke-Buy {
 }
 
 function Invoke-Sell {
-    # Executes a sell swap and accumulates received ETH.
+    # Executes a sell swap and accumulates received base.
     # Does NOT call exit -- grid continues after each sell.
     param([string]$tokenAmount, [int]$cellIndex)
 
     if ($DryRun) {
-        Write-Host ("  [DRY-RUN] Cell {0}: would SELL {1} {2} -> ETH" -f $cellIndex, $tokenAmount, $script:TokenLabel) -ForegroundColor DarkYellow
-        # Estimate received ETH for P&L display in dry-run
+        Write-Host ("  [DRY-RUN] Cell {0}: would SELL {1} {2} -> {3}" -f $cellIndex, $tokenAmount, $script:TokenLabel, $script:BaseLabel) -ForegroundColor DarkYellow
+        # Estimate received base for P&L display in dry-run
         try {
-            $q   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenAmount
-            $eth = [double]$q.buyAmount / $ETH_DECIMALS
+            $q   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenAmount
+            $eth = [double]$q.buyAmount / $script:BASE_DECIMALS_SCALE
             $script:totalEthReceived += $eth
         } catch { }
     } else {
-        Write-Host ("  >>> Cell {0} SELL: speed swap -c {1} --sell {2} --buy eth -a {3} -y" -f $cellIndex, $Chain, $Token, $tokenAmount) -ForegroundColor Cyan
-        $raw  = speed --json --yes swap -c $Chain --sell $Token --buy eth -a $tokenAmount 2>&1
-        $line = $raw | Where-Object { $_ -match '^\{' } | Select-Object -First 1
-        $res  = $line | ConvertFrom-Json
-        if ($res.PSObject.Properties.Name -contains 'error') { throw "Sell swap failed: $($res.error)" }
-        Write-Host ("  TX: {0}" -f $res.txHash) -ForegroundColor DarkGray
+        $qPre = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenAmount
+        $expectedBase = [double]$qPre.buyAmount / $script:BASE_DECIMALS_SCALE
+        Write-Host ("  >>> Cell {0} SELL: speed swap -c {1} --sell {2} --buy $BaseToken -a {3} -y" -f $cellIndex, $Chain, $Token, $tokenAmount) -ForegroundColor Cyan
+        speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
+        if ($LASTEXITCODE -ne 0) { throw "Sell swap failed (exit $LASTEXITCODE)." }
 
-        # Quote to estimate ETH received for P&L (actual amount varies by slippage)
-        try {
-            $qCheck = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenAmount
-            $script:totalEthReceived += [double]$qCheck.buyAmount / $ETH_DECIMALS
-        } catch {
-            # Fallback: assume sell level ETH
-        }
+        # P&L: use pre-execution quote (decision-time expected base), not a post-fill re-quote
+        $script:totalEthReceived += $expectedBase
     }
 
     $script:totalSells++
@@ -204,19 +196,21 @@ function Show-Grid {
 
     $ts = Get-Date -Format "HH:mm:ss"
     Write-Host ""
-    Write-Host ("[{0}] Price: {1:F8} ETH  (base: {2:F8}, {3:+0.00}%)  Buys: {4}  Sells: {5}" -f `
-        $ts, $currentETH, $baseETH, $pctFromBase, $script:totalBuys, $script:totalSells) -ForegroundColor White
-    Write-Host ("          P/L: {0}{1:F8} ETH   Spent: {2:F8} ETH   Received: {3:F8} ETH" -f `
-        $plSign, $pl, $script:totalEthSpent, $script:totalEthReceived) -ForegroundColor $plColor
+    Write-Host ("[{0}] Price: {1:F8} {6}  (base: {2:F8} {6}, {3:F2}%)  Buys: {4}  Sells: {5}" -f `
+        $ts, $currentETH, $baseETH, $pctFromBase, $script:totalBuys, $script:totalSells, $script:BaseLabel) -ForegroundColor White
+    Write-Host ("          P/L: {0}{1:F8} {4}   Spent: {2:F8} {4}   Received: {3:F8} {4}" -f `
+        $plSign, $pl, $script:totalEthSpent, $script:totalEthReceived, $script:BaseLabel) -ForegroundColor $plColor
     Write-Host ""
-    Write-Host ("  {0,-3}  {1,-14}  {2,-14}  {3,-12}  {4,-20}  {5}" -f `
-        "#", "Buy Level ETH", "Sell Level ETH", "Status", "Token Held", "ETH Spent") -ForegroundColor DarkGray
-    Write-Host ("  {0,-3}  {1,-14}  {2,-14}  {3,-12}  {4,-20}  {5}" -f `
-        "-", "--------------", "--------------", "------------", "--------------------", "---------") -ForegroundColor DarkGray
+    $blCol = "Buy lvl ($($script:BaseLabel))"
+    $slCol = "Sell lvl ($($script:BaseLabel))"
+    Write-Host ("  {0,-3}  {1,-18}  {2,-18}  {3,-12}  {4,-20}  {5}" -f `
+        "#", $blCol, $slCol, "Status", "Token Held", "Base spent") -ForegroundColor DarkGray
+    Write-Host ("  {0,-3}  {1,-18}  {2,-18}  {3,-12}  {4,-20}  {5}" -f `
+        "-", "------------------", "------------------", "------------", "--------------------", "----------") -ForegroundColor DarkGray
 
     foreach ($cell in $cells) {
-        $buyETH  = $cell.BuyLevelRaw / $ETH_DECIMALS
-        $sellETH = $cell.SellLevelRaw / $ETH_DECIMALS
+        $buyETH  = $cell.BuyLevelRaw / $script:BASE_DECIMALS_SCALE
+        $sellETH = $cell.SellLevelRaw / $script:BASE_DECIMALS_SCALE
 
         if ($cell.Status -eq "filled") {
             $statusStr = "FILLED  *"
@@ -232,7 +226,7 @@ function Show-Grid {
             $color     = if ($distancePct -le $GridPct) { "DarkYellow" } else { "White" }
         }
 
-        Write-Host ("  {0,-3}  {1,-14}  {2,-14}  {3,-12}  {4,-20}  {5}" -f `
+        Write-Host ("  {0,-3}  {1,-18}  {2,-18}  {3,-12}  {4,-20}  {5}" -f `
             $cell.Index, $buyETH.ToString("F8"), $sellETH.ToString("F8"), `
             $statusStr, $heldStr, $spentStr) -ForegroundColor $color
     }
@@ -248,22 +242,28 @@ $script:tokenDecimals      = $tokenDecimals
 $script:TOKEN_DECIMALS_SCALE = [Math]::Pow(10, $tokenDecimals)
 $script:TokenLabel         = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
 Write-Host ""
 Write-Host "=== Speed Grid Trading Bot ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- no swaps will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain         : $Chain"
 Write-Host "  Token         : $script:TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  ETH per grid  : $EthPerGrid ETH"
+Write-Host "  Base per grid : $BasePerGrid $($script:BaseLabel)"
 Write-Host "  Grid levels   : $Levels  (buy levels below current price)"
 Write-Host "  Grid spacing  : $GridPct %"
-Write-Host "  Max ETH outlay: $(([double]$EthPerGrid * $Levels).ToString("F8")) ETH (if all levels fill)"
+Write-Host "  Max base outlay: $(([double]$BasePerGrid * $Levels).ToString("F8")) $($script:BaseLabel) (if all levels fill)"
 Write-Host "  Poll interval : $PollSeconds s"
 Write-Host "  Max polls     : $MaxIterations"
 Write-Host ""
 
-# Step 1: quote EthPerGrid ETH -> Token to get refTokenAmount
-Write-Host "Step 1 - Quoting $EthPerGrid ETH -> $script:TokenLabel to get reference amount..." -ForegroundColor DarkCyan
-$buyQuote      = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $EthPerGrid
+# Step 1: quote BasePerGrid BaseToken -> Token to get refTokenAmount
+Write-Host "Step 1 - Quoting $BasePerGrid $($script:BaseLabel) -> $script:TokenLabel to get reference amount..." -ForegroundColor DarkCyan
+$buyQuote      = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $BasePerGrid
 $refTokenRaw   = [double]$buyQuote.buyAmount
 $refTokenHuman = $refTokenRaw / $script:TOKEN_DECIMALS_SCALE
 $refTokenStr   = $refTokenHuman.ToString("F$tokenDecimals")
@@ -272,16 +272,16 @@ if ([double]$refTokenStr -le 0) {
     Write-Error "Reference token amount resolved to 0. Aborting."
     exit 1
 }
-Write-Host ("  Reference amount : {0} {1} (per {2} ETH grid)" -f $refTokenStr, $script:TokenLabel, $EthPerGrid)
+Write-Host ("  Reference amount : {0} {1} (per {2} {3} grid)" -f $refTokenStr, $script:TokenLabel, $BasePerGrid, $script:BaseLabel)
 
-# Step 2: quote refTokenAmount Token -> ETH to establish basePrice
+# Step 2: quote refTokenAmount Token -> BaseToken to establish basePrice
 Write-Host ""
-Write-Host "Step 2 - Quoting $script:TokenLabel -> ETH to establish base price..." -ForegroundColor DarkCyan
-$sellQuote = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+Write-Host "Step 2 - Quoting $script:TokenLabel -> $($script:BaseLabel) to establish base price..." -ForegroundColor DarkCyan
+$sellQuote = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
 $baseRaw   = [double]$sellQuote.buyAmount
-$baseETH   = $baseRaw / $ETH_DECIMALS
+$baseETH   = $baseRaw / $script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Base price : {0:F8} ETH (for {1} {2})" -f $baseETH, $refTokenStr, $script:TokenLabel)
+Write-Host ("  Base price : {0:F8} {3} (for {1} {2})" -f $baseETH, $refTokenStr, $script:TokenLabel, $script:BaseLabel)
 Write-Host ""
 
 # Step 3: build grid cells
@@ -299,8 +299,8 @@ for ($i = 0; $i -lt $Levels; $i++) {
         TokenHeldStr = ""
         EthSpent     = 0.0
     }
-    Write-Host ("  Cell {0}: buy at or below {1:F8} ETH  |  sell at or above {2:F8} ETH" -f `
-        $i, ($buyRaw / $ETH_DECIMALS), ($sellRaw / $ETH_DECIMALS)) -ForegroundColor DarkGray
+    Write-Host ("  Cell {0}: buy at or below {1:F8} {3}  |  sell at or above {2:F8} {3}" -f `
+        $i, ($buyRaw / $script:BASE_DECIMALS_SCALE), ($sellRaw / $script:BASE_DECIMALS_SCALE), $script:BaseLabel) -ForegroundColor DarkGray
 }
 Write-Host ""
 
@@ -318,14 +318,14 @@ while ($iteration -lt $MaxIterations) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $currentETH = $currentRaw / $script:BASE_DECIMALS_SCALE
 
-        # -- process sells first (recoup ETH before spending on new buys) ------
+        # -- process sells first (recoup base before spending on new buys) ------
         foreach ($cell in ($gridCells | Where-Object { $_.Status -eq "filled" })) {
             if ($currentRaw -ge $cell.SellLevelRaw) {
-                $sellETH = $cell.SellLevelRaw / $ETH_DECIMALS
+                $sellETH = $cell.SellLevelRaw / $script:BASE_DECIMALS_SCALE
                 Write-Host ("  Cell {0}: SELL triggered  (price {1:F8} / sell level {2:F8})" -f `
                     $cell.Index, $currentETH, $sellETH) -ForegroundColor Green
                 try {
@@ -345,14 +345,14 @@ while ($iteration -lt $MaxIterations) {
 
         foreach ($cell in $pendingCells) {
             if ($currentRaw -le $cell.BuyLevelRaw) {
-                $buyETH = $cell.BuyLevelRaw / $ETH_DECIMALS
+                $buyETH = $cell.BuyLevelRaw / $script:BASE_DECIMALS_SCALE
                 Write-Host ("  Cell {0}: BUY triggered  (price {1:F8} / buy level {2:F8})" -f `
                     $cell.Index, $currentETH, $buyETH) -ForegroundColor Magenta
                 try {
-                    $tokenStr            = Invoke-Buy -ethAmount $EthPerGrid -cellIndex $cell.Index
+                    $tokenStr            = Invoke-Buy -ethAmount $BasePerGrid -cellIndex $cell.Index
                     $cell.Status         = "filled"
                     $cell.TokenHeldStr   = $tokenStr
-                    $cell.EthSpent       = [double]$EthPerGrid
+                    $cell.EthSpent       = [double]$BasePerGrid
                 } catch {
                     Write-Warning "Buy failed for cell $($cell.Index): $_ -- skipping."
                 }
@@ -389,7 +389,7 @@ Write-Host ""
 Write-Host "=== Grid Session Complete ===" -ForegroundColor Yellow
 Write-Host ("  Total buys      : {0}" -f $script:totalBuys)
 Write-Host ("  Total sells     : {0}" -f $script:totalSells)
-Write-Host ("  ETH spent       : {0:F8} ETH" -f $script:totalEthSpent)
-Write-Host ("  ETH received    : {0:F8} ETH" -f $script:totalEthReceived)
+Write-Host ("  Base spent      : {0:F8} {1}" -f $script:totalEthSpent, $script:BaseLabel)
+Write-Host ("  Base received   : {0:F8} {1}" -f $script:totalEthReceived, $script:BaseLabel)
 $plColor2 = if ($pl -ge 0) { "Green" } else { "DarkRed" }
-Write-Host ("  Net P/L         : {0}{1:F8} ETH" -f $plSign, $pl) -ForegroundColor $plColor2
+Write-Host ("  Net P/L         : {0}{1:F8} {2}" -f $plSign, $pl, $script:BaseLabel) -ForegroundColor $plColor2

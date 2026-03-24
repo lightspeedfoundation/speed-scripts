@@ -31,6 +31,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../_common.sh
+source "$SCRIPT_DIR/../_common.sh"
+
 # -- defaults -----------------------------------------------------------------
 CHAIN=""
 TOKEN=""
@@ -41,6 +45,8 @@ TOKEN_SYMBOL=""
 POLL_SECONDS=60
 MAX_ITERATIONS=2880
 DRY_RUN=0
+BASE_TOKEN="speed"
+BASE_TOKEN_SYMBOL=""
 
 # -- argument parsing ---------------------------------------------------------
 usage() {
@@ -58,6 +64,8 @@ while [[ $# -gt 0 ]]; do
         --token-symbol)   TOKEN_SYMBOL="$2";   shift 2 ;;
         --poll-seconds)   POLL_SECONDS="$2";   shift 2 ;;
         --max-iterations) MAX_ITERATIONS="$2"; shift 2 ;;
+        --base-token)         BASE_TOKEN="$2";       shift 2 ;;
+        --base-token-symbol)  BASE_TOKEN_SYMBOL="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1;           shift   ;;
         --help|-h)        usage ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
@@ -69,6 +77,11 @@ for req in CHAIN TOKEN ETH_PER_GRID LEVELS GRID_PCT; do
 done
 
 TOKEN_LABEL="${TOKEN_SYMBOL:-$TOKEN}"
+
+BASE_TOKEN="$(speed_v2_resolve_base_token "$TOKEN" "$BASE_TOKEN")"
+BASE_DECIMALS=$(speed_v2_get_token_decimals "$BASE_TOKEN" "$CHAIN")
+BASE_SCALE=$(awk "BEGIN { printf \"%.0f\", 10 ^ $BASE_DECIMALS }")
+BASE_LABEL="$(speed_v2_base_label "$BASE_TOKEN_SYMBOL" "$BASE_TOKEN")"
 
 # -- RPC endpoints ------------------------------------------------------------
 get_rpc() {
@@ -84,8 +97,8 @@ get_rpc() {
 }
 
 # -- P/L accumulators ---------------------------------------------------------
-total_eth_spent=0
-total_eth_received=0
+total_eth_spent="0.00000000"
+total_eth_received="0.00000000"
 total_buys=0
 total_sells=0
 
@@ -98,40 +111,16 @@ grid_eth_spent_cell=() # human ETH string per cell
 
 # -- helpers ------------------------------------------------------------------
 
-get_token_decimals() {
-    local token="$1" chain="$2"
-    local lower="${token,,}"
-    [[ "$lower" =~ ^(speed|eth|ether|native)$ ]] && echo 18 && return
-    [[ "$lower" != 0x* ]] && echo 18 && return
-
-    local rpc
-    rpc=$(get_rpc "$chain")
-    [[ -z "$rpc" ]] && echo 18 && return
-
-    local body="{\"jsonrpc\":\"2.0\",\"method\":\"eth_call\",\"params\":[{\"to\":\"$token\",\"data\":\"0x313ce567\"},\"latest\"],\"id\":1}"
-    local resp hex
-    resp=$(curl -sf -X POST "$rpc" -H "Content-Type: application/json" -d "$body" 2>/dev/null) || { echo 18; return; }
-    hex=$(echo "$resp" | grep -oP '"result"\s*:\s*"\K[^"]+' | sed 's/^0x//' | sed 's/^0*//')
-    [[ -z "$hex" ]] && echo 18 && return
-    echo "obase=10; ibase=16; ${hex^^}" | bc 2>/dev/null || echo 18
-}
+get_token_decimals() { speed_v2_get_token_decimals "$1" "$2"; }
 
 get_quote() {
     local sell_tok="$1" buy_tok="$2" sell_amt="$3"
-    local output json
-    output=$(speed quote --json -c "$CHAIN" --sell "$sell_tok" --buy "$buy_tok" -a "$sell_amt" 2>&1)
-    json=$(echo "$output" | grep -m1 '^{')
-    [[ -z "$json" ]] && { echo "No JSON from quote. Output: $output" >&2; return 1; }
-    echo "$json" | grep -q '"error"' && {
-        local err; err=$(echo "$json" | grep -oP '"error"\s*:\s*"\K[^"]+')
-        echo "Quote error: $err" >&2; return 1
-    }
-    echo "$json"
+    speed_v2_get_quote "$CHAIN" "$sell_tok" "$buy_tok" "$sell_amt"
 }
 
 extract_field() {
-    local json="$1" field="$2"
-    echo "$json" | grep -oP "\"$field\"\s*:\s*\"\K[^\"]+|\"$field\"\s*:\s*\K[0-9.]+" | head -1
+    # JSON buyAmount only (portable; no grep -P in Git Bash)
+    speed_v2_extract_buy_amount "$1"
 }
 
 # awk-based float comparison: returns 0 (true) if $1 >= $2
@@ -147,14 +136,14 @@ fmt_token() {
 
 fmt_eth() {
     local raw="$1"
-    awk "BEGIN { printf \"%.8f\", $raw / 1e18 }"
+    awk "BEGIN { printf \"%.8f\", $raw / $BASE_SCALE }"
 }
 
 invoke_buy() {
     local eth_amount="$1" cell_idx="$2"
 
     local q_json buy_raw token_human token_str
-    q_json=$(get_quote "eth" "$TOKEN" "$eth_amount") || { echo "Quote failed for buy cell $cell_idx" >&2; return 1; }
+    q_json=$(get_quote "$BASE_TOKEN" "$TOKEN" "$eth_amount") || { echo "Quote failed for buy cell $cell_idx" >&2; return 1; }
     buy_raw=$(extract_field "$q_json" "buyAmount")
     token_human=$(awk "BEGIN { printf \"%.*f\", $TOKEN_DECIMALS, $buy_raw / $TOKEN_SCALE }")
     token_str="$token_human"
@@ -166,18 +155,12 @@ invoke_buy() {
     fi
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "  [DRY-RUN] Cell $cell_idx: would BUY $token_str $TOKEN_LABEL for $eth_amount ETH" >&2
+        echo "  [DRY-RUN] Cell $cell_idx: would BUY $token_str $TOKEN_LABEL for $eth_amount $BASE_LABEL" >&2
     else
-        echo "  >>> Cell $cell_idx BUY: speed swap -c $CHAIN --sell eth --buy $TOKEN -a $eth_amount -y" >&2
-        local raw_out json_out tx_hash
-        raw_out=$(speed --json --yes swap -c "$CHAIN" --sell eth --buy "$TOKEN" -a "$eth_amount" 2>&1)
-        json_out=$(echo "$raw_out" | grep -m1 '^{')
-        if echo "$json_out" | grep -q '"error"'; then
-            local err; err=$(extract_field "$json_out" "error")
-            echo "Buy swap failed: $err" >&2; return 1
+        echo "  >>> Cell $cell_idx BUY: speed swap -c $CHAIN --sell ${BASE_TOKEN} --buy $TOKEN -a $eth_amount -y" >&2
+        if ! speed swap -c "$CHAIN" --sell "$BASE_TOKEN" --buy "$TOKEN" -a "$eth_amount" -y; then
+            echo "Buy swap failed." >&2; return 1
         fi
-        tx_hash=$(extract_field "$json_out" "txHash")
-        echo "  TX: $tx_hash" >&2
     fi
 
     total_eth_spent=$(awk "BEGIN { printf \"%.8f\", $total_eth_spent + $eth_amount }")
@@ -189,32 +172,26 @@ invoke_sell() {
     local token_amount="$1" cell_idx="$2"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "  [DRY-RUN] Cell $cell_idx: would SELL $token_amount $TOKEN_LABEL -> ETH" >&2
+        echo "  [DRY-RUN] Cell $cell_idx: would SELL $token_amount $TOKEN_LABEL -> $BASE_LABEL" >&2
         local q_json eth_back
-        q_json=$(get_quote "$TOKEN" "eth" "$token_amount" 2>/dev/null) || true
+        q_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$token_amount" 2>/dev/null) || true
         if [[ -n "$q_json" ]]; then
-            local eth_raw; eth_raw=$(extract_field "$q_json" "buyAmount")
-            eth_back=$(awk "BEGIN { printf \"%.8f\", $eth_raw / 1e18 }")
+            local eth_raw; eth_raw=$(extract_field "$q_json")
+            eth_back=$(awk "BEGIN { printf \"%.8f\", $eth_raw / $BASE_SCALE }")
             total_eth_received=$(awk "BEGIN { printf \"%.8f\", $total_eth_received + $eth_back }")
         fi
     else
-        echo "  >>> Cell $cell_idx SELL: speed swap -c $CHAIN --sell $TOKEN --buy eth -a $token_amount -y" >&2
-        local raw_out json_out tx_hash
-        raw_out=$(speed --json --yes swap -c "$CHAIN" --sell "$TOKEN" --buy eth -a "$token_amount" 2>&1)
-        json_out=$(echo "$raw_out" | grep -m1 '^{')
-        if echo "$json_out" | grep -q '"error"'; then
-            local err; err=$(extract_field "$json_out" "error")
-            echo "Sell swap failed: $err" >&2; return 1
+        echo "  >>> Cell $cell_idx SELL: speed swap -c $CHAIN --sell $TOKEN --buy ${BASE_TOKEN} -a $token_amount -y" >&2
+        if ! speed swap -c "$CHAIN" --sell "$TOKEN" --buy "$BASE_TOKEN" -a "$token_amount" -y; then
+            echo "Sell swap failed." >&2; return 1
         fi
-        tx_hash=$(extract_field "$json_out" "txHash")
-        echo "  TX: $tx_hash" >&2
 
         # Estimate ETH received via quote for P/L display
         local q_json2 eth_raw eth_back
-        q_json2=$(get_quote "$TOKEN" "eth" "$token_amount" 2>/dev/null) || true
+        q_json2=$(get_quote "$TOKEN" "$BASE_TOKEN" "$token_amount" 2>/dev/null) || true
         if [[ -n "$q_json2" ]]; then
             eth_raw=$(extract_field "$q_json2" "buyAmount")
-            eth_back=$(awk "BEGIN { printf \"%.8f\", $eth_raw / 1e18 }")
+            eth_back=$(awk "BEGIN { printf \"%.8f\", $eth_raw / $BASE_SCALE }")
             total_eth_received=$(awk "BEGIN { printf \"%.8f\", $total_eth_received + $eth_back }")
         fi
     fi
@@ -232,11 +209,11 @@ show_grid() {
     pl_sign=$(awk "BEGIN { print ($pl >= 0) ? \"+\" : \"\" }")
 
     echo ""
-    echo "[$ts] Price: ${current_eth} ETH  (base: ${base_eth}, ${pct_from_base}%)  Buys: $total_buys  Sells: $total_sells"
-    echo "          P/L: ${pl_sign}${pl} ETH   Spent: ${total_eth_spent} ETH   Received: ${total_eth_received} ETH"
+    echo "[$ts] Price: ${current_eth} $BASE_LABEL  (base: ${base_eth} $BASE_LABEL, ${pct_from_base}%)  Buys: $total_buys  Sells: $total_sells"
+    echo "          P/L: ${pl_sign}${pl} $BASE_LABEL   Spent: ${total_eth_spent} $BASE_LABEL   Received: ${total_eth_received} $BASE_LABEL"
     echo ""
     printf "  %-3s  %-14s  %-14s  %-12s  %-22s  %s\n" \
-        "#" "Buy Level ETH" "Sell Level ETH" "Status" "Token Held" "ETH Spent"
+        "#" "Buy Lvl $BASE_LABEL" "Sell Lvl $BASE_LABEL" "Status" "Token Held" "Base Spent"
     printf "  %-3s  %-14s  %-14s  %-12s  %-22s  %s\n" \
         "-" "--------------" "--------------" "------------" "----------------------" "---------"
 
@@ -274,19 +251,19 @@ echo "=== Speed Grid Trading Bot ==="
 [[ "$DRY_RUN" -eq 1 ]] && echo "  *** DRY-RUN MODE -- no swaps will execute ***"
 echo "  Chain         : $CHAIN"
 echo "  Token         : $TOKEN_LABEL  (decimals: $TOKEN_DECIMALS)"
-echo "  ETH per grid  : $ETH_PER_GRID ETH"
-echo "  Grid levels   : $LEVELS"
+echo "  Base per grid : $ETH_PER_GRID $BASE_LABEL"
+echo "  Grid levels   : $LEVELS  (buy levels below current price)"
 echo "  Grid spacing  : $GRID_PCT %"
 max_outlay=$(awk "BEGIN { printf \"%.8f\", $ETH_PER_GRID * $LEVELS }")
-echo "  Max ETH outlay: $max_outlay ETH (if all levels fill)"
+echo "  Max base outlay: $max_outlay $BASE_LABEL (if all levels fill)"
 echo "  Poll interval : $POLL_SECONDS s"
 echo "  Max polls     : $MAX_ITERATIONS"
 echo ""
 
 # Step 1: quote ETH_PER_GRID ETH -> TOKEN to get reference amount
-echo "Step 1 - Quoting $ETH_PER_GRID ETH -> $TOKEN_LABEL to get reference amount..."
-buy_q=$(get_quote "eth" "$TOKEN" "$ETH_PER_GRID") || { echo "Initial buy quote failed." >&2; exit 1; }
-ref_token_raw=$(extract_field "$buy_q" "buyAmount")
+echo "Step 1 - Quoting $ETH_PER_GRID $BASE_LABEL -> $TOKEN_LABEL to get reference amount..."
+buy_q=$(get_quote "$BASE_TOKEN" "$TOKEN" "$ETH_PER_GRID") || { echo "Initial buy quote failed." >&2; exit 1; }
+ref_token_raw=$(extract_field "$buy_q")
 ref_token_str=$(awk "BEGIN { printf \"%.*f\", $TOKEN_DECIMALS, $ref_token_raw / $TOKEN_SCALE }")
 
 if awk "BEGIN { exit ($ref_token_str > 0) ? 0 : 1 }" 2>/dev/null; then
@@ -294,15 +271,15 @@ if awk "BEGIN { exit ($ref_token_str > 0) ? 0 : 1 }" 2>/dev/null; then
 else
     echo "Reference token amount resolved to 0. Aborting." >&2; exit 1
 fi
-echo "  Reference amount : $ref_token_str $TOKEN_LABEL (per $ETH_PER_GRID ETH grid)"
+echo "  Reference amount : $ref_token_str $TOKEN_LABEL (per $ETH_PER_GRID $BASE_LABEL grid)"
 
 # Step 2: quote refTokenAmount TOKEN -> ETH to establish basePrice
 echo ""
-echo "Step 2 - Quoting $TOKEN_LABEL -> ETH to establish base price..."
-sell_q=$(get_quote "$TOKEN" "eth" "$ref_token_str") || { echo "Initial sell quote failed." >&2; exit 1; }
-base_raw=$(extract_field "$sell_q" "buyAmount")
+echo "Step 2 - Quoting $TOKEN_LABEL -> $BASE_LABEL to establish base price..."
+sell_q=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str") || { echo "Initial sell quote failed." >&2; exit 1; }
+base_raw=$(extract_field "$sell_q")
 base_eth=$(fmt_eth "$base_raw")
-echo "  Base price : $base_eth ETH (for $ref_token_str $TOKEN_LABEL)"
+echo "  Base price : $base_eth $BASE_LABEL (for $ref_token_str $TOKEN_LABEL)"
 echo ""
 
 # Step 3: build grid arrays
@@ -318,7 +295,7 @@ for (( i=0; i<LEVELS; i++ )); do
 
     buy_eth_disp=$(fmt_eth "$buy_raw_f")
     sell_eth_disp=$(fmt_eth "$sell_raw_f")
-    echo "  Cell $i: buy at or below $buy_eth_disp ETH  |  sell at or above $sell_eth_disp ETH"
+    echo "  Cell $i: buy at or below $buy_eth_disp $BASE_LABEL  |  sell at or above $sell_eth_disp $BASE_LABEL"
 done
 echo ""
 
@@ -333,7 +310,7 @@ while (( iteration < MAX_ITERATIONS )); do
     echo "[$ts] Poll $iteration / $MAX_ITERATIONS  - waiting $POLL_SECONDS s..."
     sleep "$POLL_SECONDS"
 
-    q_json=$(get_quote "$TOKEN" "eth" "$ref_token_str" 2>&1) || {
+    q_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str" 2>&1) || {
         echo "Warning: poll $iteration quote failed -- retrying next interval." >&2
         continue
     }
@@ -415,6 +392,6 @@ echo ""
 echo "=== Grid Session Complete ==="
 echo "  Total buys      : $total_buys"
 echo "  Total sells     : $total_sells"
-echo "  ETH spent       : $total_eth_spent ETH"
-echo "  ETH received    : $total_eth_received ETH"
-echo "  Net P/L         : ${pl_sign}${pl} ETH"
+echo "  Base spent      : $total_eth_spent $BASE_LABEL"
+echo "  Base received   : $total_eth_received $BASE_LABEL"
+echo "  Net P/L         : ${pl_sign}${pl} $BASE_LABEL"

@@ -1,19 +1,19 @@
 <#
 .SYNOPSIS
-    Bracket (OCO) order: buy any token with ETH, then hold two simultaneous exit
+    Bracket (OCO) order: buy any token with -BaseToken, then hold two simultaneous exit
     conditions — a take-profit ceiling and a stop-loss floor. The first to trigger
     fires the sell; the other is cancelled automatically.
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes ETH -> <Token> to show what you will get.
-    3. Executes the buy (ETH -> <Token>).
+    2. Quotes BaseToken -> <Token> to show what you will get.
+    3. Executes the buy (BaseToken -> <Token>).
     4. Gets a baseline sell quote to anchor both levels:
          takeTarget = baselineRaw * (1 + TakePct/100)
          stopFloor  = baselineRaw * (1 - StopPct/100)
     5. Polls every -PollSeconds seconds.
-       - If ETH return >= takeTarget : take-profit fires -> sell and exit.
-       - If ETH return <= stopFloor  : stop-loss fires   -> sell and exit.
+       - If base return >= takeTarget : take-profit fires -> sell and exit.
+       - If base return <= stopFloor  : stop-loss fires   -> sell and exit.
     6. Falls back to a market sell after -MaxIterations polls.
 
     Philosophically: every other script exits on ONE condition. Bracket defines
@@ -21,16 +21,16 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    Exit levels are measured in -BaseToken returned for the full position.
 
 .PARAMETER Amount
-    ETH to spend on the initial buy.
+    Amount of -BaseToken to spend on the initial buy (speed swap -a uses this asset).
 
 .PARAMETER TakePct
-    % above baseline ETH return to trigger the take-profit sell.
+    % above baseline base return to trigger the take-profit sell.
 
 .PARAMETER StopPct
-    % below baseline ETH return to trigger the stop-loss sell.
+    % below baseline base return to trigger the stop-loss sell.
 
 .PARAMETER DryRun
     Log bracket signals without buying or selling.
@@ -50,13 +50,14 @@ param(
     [string]  $TokenSymbol   = "",
     [int]     $PollSeconds   = 60,
     [int]     $MaxIterations = 1440,
-    [switch]  $DryRun
+    [switch]  $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -118,8 +119,8 @@ function Get-Quote {
 function Run-Sell {
     param([string]$tokenAmount, [string]$reason)
     Write-Host ""
-    Write-Host ">>> $reason - Executing: speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y" -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y
+    Write-Host ">>> $reason - Executing: speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
     exit $LASTEXITCODE
 }
 
@@ -131,6 +132,12 @@ $tokenDecimals = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
 $TOKEN_SCALE   = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel    = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
 if ($TakePct -le 0) { Write-Error "-TakePct must be > 0."; exit 1 }
 if ($StopPct -le 0) { Write-Error "-StopPct must be > 0."; exit 1 }
 
@@ -139,7 +146,7 @@ Write-Host "=== Speed Bracket Order (OCO) ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- no buy or sell will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain         : $Chain"
 Write-Host "  Token         : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  ETH spent     : $Amount ETH"
+Write-Host "  Base spent    : $Amount $($script:BaseLabel)"
 Write-Host "  Take-profit   : +$TakePct % above entry baseline"
 Write-Host "  Stop-loss     : -$StopPct % below entry baseline"
 Write-Host "  Poll interval : $PollSeconds s"
@@ -148,9 +155,9 @@ Write-Host ""
 
 # -- step 1: quote the buy -----------------------------------------------------
 
-Write-Host "Step 1 - Quoting ETH -> $TokenLabel for $Amount ETH..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $($script:BaseLabel) -> $TokenLabel for $Amount $($script:BaseLabel)..." -ForegroundColor DarkCyan
 
-$buyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
+$buyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
 $tokenRaw   = [double]$buyQuote.buyAmount
 $tokenHuman = $tokenRaw / $TOKEN_SCALE
 $tokenStr   = $tokenHuman.ToString("F$tokenDecimals")
@@ -159,7 +166,7 @@ if ([double]$tokenStr -le 0) {
     Write-Error "Token amount resolved to 0 (raw=$tokenRaw, decimals=$tokenDecimals). Aborting."
     exit 1
 }
-Write-Host ("  You will get : {0} {1} for {2} ETH" -f $tokenStr, $TokenLabel, $Amount)
+Write-Host ("  You will get : {0} {1} for {2} {3}" -f $tokenStr, $TokenLabel, $Amount, $script:BaseLabel)
 Write-Host ""
 
 # -- step 2: execute the buy ---------------------------------------------------
@@ -167,10 +174,10 @@ Write-Host ""
 Write-Host "Step 2 - Buying $TokenLabel..." -ForegroundColor DarkCyan
 
 if ($DryRun) {
-    Write-Host "  [DRY-RUN] Would execute: speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor DarkYellow
+    Write-Host "  [DRY-RUN] Would execute: speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor DarkYellow
 } else {
-    Write-Host ">>> Executing: speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor Cyan
-    speed swap -c $Chain --sell eth --buy $Token -a $Amount -y
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Buy swap failed (exit $LASTEXITCODE). Aborting."
         exit $LASTEXITCODE
@@ -180,20 +187,20 @@ Write-Host ""
 
 # -- step 3: baseline sell quote — anchors both levels -------------------------
 
-Write-Host "Step 3 - Baseline sell quote ($TokenLabel -> ETH)..." -ForegroundColor DarkCyan
+Write-Host "Step 3 - Baseline sell quote ($TokenLabel -> $($script:BaseLabel))..." -ForegroundColor DarkCyan
 
-$sellQuote   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+$sellQuote   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
 $baselineRaw = [double]$sellQuote.buyAmount
-$baselineETH = $baselineRaw / $ETH_DECIMALS
+$baselineETH = $baselineRaw / $script:BASE_DECIMALS_SCALE
 
 $takeTargetRaw = $baselineRaw * (1.0 + $TakePct / 100.0)
 $stopFloorRaw  = $baselineRaw * (1.0 - $StopPct / 100.0)
-$takeTargetETH = $takeTargetRaw / $ETH_DECIMALS
-$stopFloorETH  = $stopFloorRaw  / $ETH_DECIMALS
+$takeTargetETH = $takeTargetRaw / $script:BASE_DECIMALS_SCALE
+$stopFloorETH  = $stopFloorRaw  / $script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Baseline ETH back : {0:F8} ETH" -f $baselineETH)
-Write-Host ("  Take-profit target: {0:F8} ETH  (baseline +{1}%)" -f $takeTargetETH, $TakePct)
-Write-Host ("  Stop-loss floor   : {0:F8} ETH  (baseline -{1}%)" -f $stopFloorETH, $StopPct)
+Write-Host ("  Baseline {1} back : {0:F8} {1}" -f $baselineETH, $script:BaseLabel)
+Write-Host ("  Take-profit target: {0:F8} {2}  (baseline +{1}%)" -f $takeTargetETH, $TakePct, $script:BaseLabel)
+Write-Host ("  Stop-loss floor   : {0:F8} {2}  (baseline -{1}%)" -f $stopFloorETH, $StopPct, $script:BaseLabel)
 Write-Host ""
 
 # -- step 4: poll for bracket exits --------------------------------------------
@@ -210,14 +217,14 @@ while ($iteration -lt $MaxIterations) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
         $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $currentETH = $currentRaw / $script:BASE_DECIMALS_SCALE
         $ts2        = Get-Date -Format "HH:mm:ss"
 
         $pctVsBase = (($currentRaw - $baselineRaw) / $baselineRaw) * 100.0
-        $pctToTP   = (($takeTargetRaw - $currentRaw) / $takeTargetRaw) * 100.0
-        $pctToSL   = (($currentRaw - $stopFloorRaw)  / $stopFloorRaw)  * 100.0
+        $pctToTP   = if ($currentRaw -gt 0) { (($takeTargetRaw - $currentRaw) / $currentRaw) * 100.0 } else { 0.0 }
+        $pctToSL   = if ($currentRaw -gt 0) { (($currentRaw - $stopFloorRaw)  / $currentRaw) * 100.0 } else { 0.0 }
 
         # Color logic: green = at/above TP, red = at/below SL, yellow = within 25% of either level
         $tpZone = ($takeTargetRaw - $baselineRaw) * 0.25
@@ -235,16 +242,16 @@ while ($iteration -lt $MaxIterations) {
             $color = "White"
         }
 
-        Write-Host ("[$ts2] {0:F8} ETH  ({1:+0.4f}% vs entry)  TP: {2:+0.4f}% away  SL: {3:+0.4f}% away  [take: {4:F8}  stop: {5:F8}]" -f `
-            $currentETH, $pctVsBase, (-$pctToTP), (-$pctToSL), $takeTargetETH, $stopFloorETH) -ForegroundColor $color
+        Write-Host ("[$ts2] {0:F8} {6}  ({1:F4}% vs entry)  TP: +{2:F4}% to target  SL: {3:F4}% cushion to floor  [take: {4:F8} {6}  stop: {5:F8} {6}]" -f `
+            $currentETH, $pctVsBase, $pctToTP, $pctToSL, $takeTargetETH, $stopFloorETH, $script:BaseLabel) -ForegroundColor $color
 
         # Take-profit check
         if ($currentRaw -ge $takeTargetRaw) {
             $gainPct = (($currentETH - [double]$Amount) / [double]$Amount) * 100.0
             Write-Host ""
-            Write-Host ("TAKE-PROFIT triggered! {0:F8} ETH back  ({1:F4}% gain vs ETH spent)" -f $currentETH, $gainPct) -ForegroundColor Green
+            Write-Host ("TAKE-PROFIT triggered! {0:F8} {2} back  ({1:F4}% gain vs base spent)" -f $currentETH, $gainPct, $script:BaseLabel) -ForegroundColor Green
             if ($DryRun) {
-                Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> ETH now." -ForegroundColor DarkYellow
+                Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> $($script:BaseLabel) now." -ForegroundColor DarkYellow
                 exit 0
             }
             Run-Sell -tokenAmount $tokenStr -reason "TAKE-PROFIT"
@@ -254,9 +261,9 @@ while ($iteration -lt $MaxIterations) {
         if ($currentRaw -le $stopFloorRaw) {
             $lossPct = (($currentETH - [double]$Amount) / [double]$Amount) * 100.0
             Write-Host ""
-            Write-Host ("STOP-LOSS triggered! {0:F8} ETH back  ({1:F4}% vs ETH spent)" -f $currentETH, $lossPct) -ForegroundColor Red
+            Write-Host ("STOP-LOSS triggered! {0:F8} {2} back  ({1:F4}% vs base spent)" -f $currentETH, $lossPct, $script:BaseLabel) -ForegroundColor Red
             if ($DryRun) {
-                Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> ETH now." -ForegroundColor DarkYellow
+                Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> $($script:BaseLabel) now." -ForegroundColor DarkYellow
                 exit 0
             }
             Run-Sell -tokenAmount $tokenStr -reason "STOP-LOSS"
@@ -272,7 +279,7 @@ while ($iteration -lt $MaxIterations) {
 Write-Host ""
 Write-Host "Max iterations ($MaxIterations) reached. Selling at market..." -ForegroundColor Yellow
 if ($DryRun) {
-    Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> ETH now." -ForegroundColor DarkYellow
+    Write-Host "  [DRY-RUN] Would SELL $tokenStr $TokenLabel -> $($script:BaseLabel) now." -ForegroundColor DarkYellow
     exit 0
 }
 Run-Sell -tokenAmount $tokenStr -reason "TIMEOUT"

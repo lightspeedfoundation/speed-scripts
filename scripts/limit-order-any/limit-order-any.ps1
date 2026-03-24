@@ -1,20 +1,20 @@
 <#
 .SYNOPSIS
-    Limit order: buy any token with ETH, then sell when ETH return rises by -TargetPct.
+    Limit order: buy any token with -BaseToken, then sell when base return rises by -TargetPct.
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call (no manual -TokenDecimals needed).
-    2. Quotes ETH -> <Token> to show what you will get.
-    3. Executes the buy (ETH -> <Token>).
-    4. Polls <Token> -> ETH every -PollSeconds seconds.
-    5. Fires the sell when ETH return >= original ETH * (1 + TargetPct/100).
+    2. Quotes BaseToken -> <Token> to show what you will get.
+    3. Executes the buy (BaseToken -> <Token>).
+    4. Polls <Token> -> BaseToken every -PollSeconds seconds.
+    5. Fires the sell when base return >= original base spent * (1 + TargetPct/100).
     6. Falls back to selling after -MaxIterations polls regardless.
 
-    Success is measured in ETH: you spent X ETH, you want X * (1 + target%) back.
+    Success is measured in BaseToken: you spent X base, you want X * (1 + target%) back.
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the sell token.
+    Target is measured in -BaseToken returned vs. amount spent.
 
 .EXAMPLE
     .\limit-order-any.ps1 -Chain base -Token speed -Amount 0.001 -TargetPct 5
@@ -24,17 +24,19 @@
 param(
     [Parameter(Mandatory)][string] $Chain,
     [Parameter(Mandatory)][string] $Token,      # address or alias
-    [Parameter(Mandatory)][string] $Amount,     # ETH you are spending
+    [Parameter(Mandatory)][string] $Amount,     # base token units you are spending (-BaseToken)
     [Parameter(Mandatory)][double] $TargetPct,
     [string]                       $TokenSymbol   = "",
     [int]                          $PollSeconds   = 60,
-    [int]                          $MaxIterations = 1440
+    [int]                          $MaxIterations = 1440,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = '',
+    [switch]                       $DryRun
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
 
 # RPC endpoints by chain name (mirrors CLI constants)
 $RPC_URLS = @{
@@ -99,8 +101,12 @@ function Get-Quote {
 function Run-Sell {
     param([string]$tokenAmount)
     Write-Host ""
-    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y" -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y
+    if ($script:DryRun) {
+        Write-Host ">>> [DRY-RUN] Would execute: speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y" -ForegroundColor Yellow
+        return
+    }
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
     exit $LASTEXITCODE
 }
 
@@ -114,21 +120,30 @@ $TOKEN_DECIMALS = [Math]::Pow(10, $tokenDecimals)
 
 $TokenLabel = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
+$script:DryRun = [bool]$DryRun
+
 Write-Host ""
 Write-Host "=== Speed Limit Order ===" -ForegroundColor Yellow
 Write-Host "  Chain         : $Chain"
 Write-Host "  Token         : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  ETH spent     : $Amount ETH"
+Write-Host "  Base spent    : $Amount $($script:BaseLabel)"
 Write-Host "  Target return : +$TargetPct %"
 Write-Host "  Poll interval : $PollSeconds s"
 Write-Host "  Max polls     : $MaxIterations"
+if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- no swaps will execute ***" -ForegroundColor Yellow }
 Write-Host ""
 
 # ── step 1: quote the buy ─────────────────────────────────────────────────────
 
-Write-Host "Step 1 - Quoting ETH -> $TokenLabel for $Amount ETH..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $($script:BaseLabel) -> $TokenLabel for $Amount $($script:BaseLabel)..." -ForegroundColor DarkCyan
 
-$buyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
+$buyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
 $tokenRaw   = [double]$buyQuote.buyAmount
 $tokenHuman = $tokenRaw / $TOKEN_DECIMALS
 # Format as plain decimal (no scientific notation) using token's own decimal count
@@ -139,33 +154,38 @@ if ([double]$tokenStr -le 0) {
     exit 1
 }
 
-Write-Host ("  You will get : {0} {1} for {2} ETH" -f $tokenStr, $TokenLabel, $Amount)
+Write-Host ("  You will get : {0} {1} for {2} {3}" -f $tokenStr, $TokenLabel, $Amount, $script:BaseLabel)
 Write-Host ""
 
 # ── step 2: execute the buy ───────────────────────────────────────────────────
 
-Write-Host "Step 2 - Buying $TokenLabel..." -ForegroundColor DarkCyan
-Write-Host ">>> Executing: speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor Cyan
-speed swap -c $Chain --sell eth --buy $Token -a $Amount -y
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Buy swap failed (exit $LASTEXITCODE). Aborting."
-    exit $LASTEXITCODE
+if ($DryRun) {
+    Write-Host "Step 2 - [DRY-RUN] Skipping buy; using Step 1 quote buy amount." -ForegroundColor DarkCyan
+    Write-Host ""
+} else {
+    Write-Host "Step 2 - Buying $TokenLabel..." -ForegroundColor DarkCyan
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Buy swap failed (exit $LASTEXITCODE). Aborting."
+        exit $LASTEXITCODE
+    }
+    Write-Host ""
 }
-Write-Host ""
 
 # ── step 3: baseline sell quote ───────────────────────────────────────────────
 
-Write-Host "Step 3 - Baseline sell quote ($TokenLabel -> ETH)..." -ForegroundColor DarkCyan
+Write-Host "Step 3 - Baseline sell quote ($TokenLabel -> $($script:BaseLabel))..." -ForegroundColor DarkCyan
 
-$sellQuote   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+$sellQuote   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
 $baselineRaw = [double]$sellQuote.buyAmount
-$baselineETH = $baselineRaw / $ETH_DECIMALS
+$baselineETH = $baselineRaw / $script:BASE_DECIMALS_SCALE
 
-$targetRaw = [double]$Amount * $ETH_DECIMALS * (1.0 + $TargetPct / 100.0)
+$targetRaw = [double]$Amount * $script:BASE_DECIMALS_SCALE * (1.0 + $TargetPct / 100.0)
 $targetETH = [double]$Amount * (1.0 + $TargetPct / 100.0)
 
-Write-Host ("  Baseline ETH back : {0:F8} ETH" -f $baselineETH)
-Write-Host ("  Target ETH back   : {0:F8} ETH  (paid {1} ETH, want +{2} %)" -f $targetETH, $Amount, $TargetPct)
+Write-Host ("  Baseline {1} back : {0:F8} {1}" -f $baselineETH, $script:BaseLabel)
+Write-Host ("  Target {3} back   : {0:F8} {3}  (paid {1} {3}, want +{2} %)" -f $targetETH, $Amount, $TargetPct, $script:BaseLabel)
 Write-Host ""
 
 # ── step 4: poll for target ───────────────────────────────────────────────────
@@ -179,9 +199,9 @@ while ($iteration -lt $MaxIterations) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $q        = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+        $q        = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
         $current  = [double]$q.buyAmount
-        $ethBack  = $current / $ETH_DECIMALS
+        $ethBack  = $current / $script:BASE_DECIMALS_SCALE
         $pctDelta = (($current - $targetRaw) / $targetRaw) * 100.0
         $ts2      = Get-Date -Format "HH:mm:ss"
 
@@ -196,12 +216,13 @@ while ($iteration -lt $MaxIterations) {
             $sign  = ""
         }
 
-        Write-Host ("[$ts2] {0:F8} ETH back  ({1}{2:F4} % vs target)" -f $ethBack, $sign, $pctDelta) -ForegroundColor $color
+        Write-Host ("[$ts2] {0:F8} {3} back  ({1}{2:F4} % vs target)" -f $ethBack, $sign, $pctDelta, $script:BaseLabel) -ForegroundColor $color
 
         if ($current -ge $targetRaw) {
             Write-Host ""
-            Write-Host ("Target reached! {0:F8} ETH back  (+{1:F4} % gain)" -f $ethBack, $pctDelta) -ForegroundColor Green
+            Write-Host ("Target reached! {0:F8} {2} back  (+{1:F4} % gain)" -f $ethBack, $pctDelta, $script:BaseLabel) -ForegroundColor Green
             Run-Sell $tokenStr
+            if ($script:DryRun) { exit 0 }
         }
     } catch {
         Write-Warning "Quote failed on poll $iteration : $_ - retrying next interval."
@@ -213,3 +234,4 @@ while ($iteration -lt $MaxIterations) {
 Write-Host ""
 Write-Host "Max iterations ($MaxIterations) reached. Selling now." -ForegroundColor Yellow
 Run-Sell $tokenStr
+if ($script:DryRun) { exit 0 }

@@ -7,11 +7,11 @@
     1. Auto-detects token decimals via on-chain RPC call.
     2. Parses -TokenAmount and computes sliceAmount = TokenAmount / Slices.
     3. For each slice 1..Slices:
-       a. Quotes <Token> -> ETH for sliceAmount (preview).
+       a. Quotes <Token> -> BaseToken for sliceAmount (preview).
        b. Executes the sell (or logs in DryRun).
-       c. Records ETH received and effective price.
+       c. Records BaseToken received and effective price.
        d. Waits IntervalSeconds before the next slice (skipped on last).
-    4. Prints a full execution summary: total ETH, average price, best/worst slice.
+    4. Prints a full execution summary: total base received, average price, best/worst slice.
 
     Difference from ladder-sell-any: ladder-sell exits at price targets (N profit
     levels). TWAP sell exits on time regardless of price — useful for large
@@ -20,7 +20,7 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    Proceeds are in -BaseToken (default: speed).
 
 .PARAMETER TokenAmount
     Total token amount to sell (in human-readable units, e.g. "98000" or "0.00002287").
@@ -48,13 +48,15 @@ param(
     [string]  $TokenSymbol     = "",
     [int]     $Slices          = 5,
     [int]     $IntervalSeconds = 300,
-    [switch]  $DryRun
+    [switch]  $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -121,6 +123,12 @@ $tokenDecimals = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
 $TOKEN_SCALE   = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel    = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
 if ($Slices -lt 1)          { Write-Error "-Slices must be >= 1."; exit 1 }
 if ($IntervalSeconds -lt 0) { Write-Error "-IntervalSeconds must be >= 0."; exit 1 }
 
@@ -155,36 +163,36 @@ $failedSlices = 0
 
 for ($i = 1; $i -le $Slices; $i++) {
     $ts = Get-Date -Format "HH:mm:ss"
-    Write-Host ("[$ts] Slice {0}/{1} - quoting {2} {3} -> ETH..." -f $i, $Slices, $sliceStr, $TokenLabel) -ForegroundColor DarkCyan
+    Write-Host ("[$ts] Slice {0}/{1} - quoting {2} {3} -> {4}..." -f $i, $Slices, $sliceStr, $TokenLabel, $script:BaseLabel) -ForegroundColor DarkCyan
 
     try {
-        $q       = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $sliceStr
+        $q       = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $sliceStr
         $ethRaw  = [double]$q.buyAmount
-        $ethBack = $ethRaw / $ETH_DECIMALS
+        $ethBack = $ethRaw / $script:BASE_DECIMALS_SCALE
         $price   = if ($sliceTokenHuman -gt 0) { $ethBack / $sliceTokenHuman } else { 0.0 }
 
-        Write-Host ("         Quote: {0:F8} ETH  (price: {1:F8} ETH/token)" -f $ethBack, $price) -ForegroundColor DarkGray
+        Write-Host ("         Quote: {0:F8} {2}  (price: {1:F8} {2}/token)" -f $ethBack, $price, $script:BaseLabel) -ForegroundColor DarkGray
 
         if ($DryRun) {
-            Write-Host ("         [DRY-RUN] Would SELL {0} {1} -> {2:F8} ETH" -f $sliceStr, $TokenLabel, $ethBack) -ForegroundColor DarkYellow
+            Write-Host ("         [DRY-RUN] Would SELL {0} {1} -> {2:F8} {3}" -f $sliceStr, $TokenLabel, $ethBack, $script:BaseLabel) -ForegroundColor DarkYellow
             $slicePrices += $price
             $sliceEths   += $ethBack
             $totalEthRaw += $ethRaw
         } else {
-            Write-Host ("         >>> speed swap -c $Chain --sell $Token --buy eth -a $sliceStr -y") -ForegroundColor Cyan
-            speed swap -c $Chain --sell $Token --buy eth -a $sliceStr -y
+            Write-Host ("         >>> speed swap -c $Chain --sell $Token --buy $BaseToken -a $sliceStr -y") -ForegroundColor Cyan
+            speed swap -c $Chain --sell $Token --buy $BaseToken -a $sliceStr -y
             if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Slice $i sell failed (exit $LASTEXITCODE). Skipping."
+                Write-Warning "Slice $($i) sell failed (exit $LASTEXITCODE). Skipping."
                 $failedSlices++
             } else {
                 $slicePrices += $price
                 $sliceEths   += $ethBack
                 $totalEthRaw += $ethRaw
-                Write-Host ("         Slice {0} complete. Got {1:F8} ETH." -f $i, $ethBack) -ForegroundColor Green
+                Write-Host ("         Slice {0} complete. Got {1:F8} {2}." -f $i, $ethBack, $script:BaseLabel) -ForegroundColor Green
             }
         }
     } catch {
-        Write-Warning "Slice $i failed: $_ -- skipping."
+        Write-Warning "Slice $($i) failed: $_ -- skipping."
         $failedSlices++
     }
 
@@ -201,12 +209,12 @@ Write-Host ""
 Write-Host "=== TWAP Sell Complete ===" -ForegroundColor Yellow
 
 $successSlices   = $Slices - $failedSlices
-$totalEthReceived = $totalEthRaw / $ETH_DECIMALS
+$totalEthReceived = $totalEthRaw / $script:BASE_DECIMALS_SCALE
 $totalTokenSold  = $successSlices * $sliceTokenHuman
 
 Write-Host ("  Slices completed  : {0} / {1}" -f $successSlices, $Slices)
 Write-Host ("  Total tokens sold : {0} {1}" -f $totalTokenSold.ToString("F$tokenDecimals"), $TokenLabel)
-Write-Host ("  Total ETH received: {0:F8} ETH" -f $totalEthReceived)
+Write-Host ("  Total base received: {0:F8} {1}" -f $totalEthReceived, $script:BaseLabel)
 
 if ($slicePrices.Count -gt 0) {
     $avgPrice  = ($slicePrices | Measure-Object -Average).Average
@@ -216,10 +224,10 @@ if ($slicePrices.Count -gt 0) {
     $bestSlice  = ($slicePrices | ForEach-Object -Begin { $idx=0 } -Process { [PSCustomObject]@{P=$_; I=++$idx} } | Sort-Object P -Descending | Select-Object -First 1)
     $worstSlice = ($slicePrices | ForEach-Object -Begin { $idx=0 } -Process { [PSCustomObject]@{P=$_; I=++$idx} } | Sort-Object P | Select-Object -First 1)
 
-    Write-Host ("  Average price     : {0:F8} ETH/token" -f $avgPrice)
-    Write-Host ("  Price range       : {0:F8} to {1:F8} ETH/token" -f $minPrice, $maxPrice)
-    Write-Host ("  Best slice        : Slice {0}  ({1:F8} ETH/token)" -f $bestSlice.I, $bestSlice.P)
-    Write-Host ("  Worst slice       : Slice {0}  ({1:F8} ETH/token)" -f $worstSlice.I, $worstSlice.P)
+    Write-Host ("  Average price     : {0:F8} {1}/token" -f $avgPrice, $script:BaseLabel)
+    Write-Host ("  Price range       : {0:F8} to {1:F8} {2}/token" -f $minPrice, $maxPrice, $script:BaseLabel)
+    Write-Host ("  Best slice        : Slice {0}  ({1:F8} {2}/token)" -f $bestSlice.I, $bestSlice.P, $script:BaseLabel)
+    Write-Host ("  Worst slice       : Slice {0}  ({1:F8} {2}/token)" -f $worstSlice.I, $worstSlice.P, $script:BaseLabel)
 }
 
 if ($failedSlices -gt 0) {

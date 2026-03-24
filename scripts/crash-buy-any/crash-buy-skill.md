@@ -1,3 +1,16 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+Spend/quote amounts (e.g. `-Amount`, `-TotalAmount`, `-BasePerGrid`, `-BasePerRung`) are in **units of the base token**. Use `../scripts/` if you want ETH-only bots unchanged.
+
+---
+
 # Crash Buy Skill
 
 Complete reference for `crash-buy-any.ps1` and `crash-buy-any.sh` — velocity-based crash entry bots built on the `speed` CLI.
@@ -54,12 +67,14 @@ A token at its 30-day mean can crash 8% in 30 seconds. Mean-revert would not tri
 | Parameter (PS1)   | Flag (SH)             | Type    | Default  | Description |
 |---|---|---|---|---|
 | `-Chain`          | `--chain`             | string  | required | Chain name or ID (`base`, `ethereum`, `arbitrum`, etc.) |
-| `-Token`          | `--token`             | string  | required | Token contract address or alias (`speed`). ETH is always the quote currency. |
-| `-Amount`         | `--amount`            | string  | required | ETH to spend when a crash is confirmed. |
+| `-Token`          | `--token`             | string  | required | Token contract address or alias (`speed`, `cbBTC`, …). |
+| `-Amount`         | `--amount`            | string  | required | Base token to spend when a crash is confirmed (same units as `speed swap -a`). |
+| `-BaseToken`      | `--base-token`        | string  | `speed`  | Quote token address or alias (`speed`, `eth`, …). |
+| `-BaseTokenSymbol`| `--base-token-symbol` | string  | (optional) | Display label for the base token in logs. |
 | `-CrashPct`       | `--crash-pct`         | float   | required | % drop below the rolling baseline required to trigger the buy. |
 | `-BaselinePolls`  | `--baseline-polls`    | integer | `1`      | Number of recent polls whose mean forms the crash baseline. `1` = single-poll comparison (maximum sensitivity). `3-5` = rolling mean; resists single-tick whale false positives on thin pairs. Detection does not begin until the window has this many entries. |
 | `-TrailPct`       | `--trail-pct`         | float   | `5`      | Trailing stop % applied after buy entry. |
-| `-TokenSymbol`    | `--tokensymbol`       | string  | address  | Display label for the token in output. |
+| `-TokenSymbol`    | `--tokensymbol`       | string  | `""`     | Optional display label for the token (defaults to address or alias). |
 | `-PollSeconds`    | `--pollseconds`       | integer | `30`     | Seconds between price polls. Default is shorter than other scripts — velocity detection needs higher frequency. |
 | `-MaxIterations`  | `--maxiterations`     | integer | `2880`   | Max total polls (detection + hold). Default 2880 × 30s = 24 hours. |
 | `-DryRun`         | `--dry-run`           | switch  | off      | Log crash signals without buying. |
@@ -70,9 +85,9 @@ A token at its 30-day mean can crash 8% in 30 seconds. Mean-revert would not tri
 
 ### Price oracle
 
-Price is measured as: **ETH returned for a fixed reference token amount** (`refTokenStr`).
+Price is measured as: **base token returned for a fixed reference token amount** (`refTokenStr`).
 
-`refTokenStr` is determined once at startup by quoting `Amount` ETH → Token. The same amount is used throughout.
+`refTokenStr` is determined once at startup by quoting `Amount` **base token** → Token. The same reference size is used throughout.
 
 ### Crash detection
 
@@ -115,10 +130,10 @@ Shorter `PollSeconds` = detects faster crashes, but also more vulnerable to tran
 After the crash buy executes:
 
 ```
-peakRaw  = quote(refTokenStr → ETH) immediately after buy
+peakRaw  = quote(refTokenStr → BaseToken) immediately after buy
 floorRaw = peakRaw × (1 − TrailPct / 100)
 
-Each poll: re-quote refTokenStr → ETH
+Each poll: re-quote refTokenStr → BaseToken
   If currentRaw > peakRaw: peak and floor rise
   If currentRaw ≤ floorRaw: sell immediately
 ```
@@ -129,15 +144,15 @@ Each poll: re-quote refTokenStr → ETH
 
 ```
 Phase 1 — Reference quote (no buy)
-  Quote Amount ETH → Token to establish refTokenStr
+  Quote Amount BaseToken → Token to establish refTokenStr
 
 Phase 2 — Initial price + window seed
-  Quote refTokenStr → ETH = initRaw
+  Quote refTokenStr → BaseToken = initRaw
   priceWindow = [initRaw]
 
 Phase 3 — Crash detection loop
   Each poll:
-    currentRaw = quote(refTokenStr → ETH)
+    currentRaw = quote(refTokenStr → BaseToken)
     Append currentRaw to priceWindow; drop oldest if len > BaselinePolls+1
     If window not yet full: print warm-up status, continue
     baselineRaw = mean(priceWindow excluding currentRaw)
@@ -146,11 +161,11 @@ Phase 3 — Crash detection loop
     Else: continue (window slides forward on next poll)
 
 Phase 4 — Crash buy
-  Execute: speed swap -c Chain --sell eth --buy Token -a Amount -y
+  Execute: speed swap -c Chain --sell BaseToken --buy Token -a Amount -y
   Quote post-buy price to anchor peakRaw, floorRaw
 
 Phase 5 — Trailing stop
-  Each poll: re-quote refTokenStr → ETH
+  Each poll: re-quote refTokenStr → BaseToken
   Update peak/floor if new high
   Sell if currentRaw <= floorRaw
   MaxIterations reached → sell at market
@@ -208,25 +223,27 @@ chmod +x crash-buy-any.sh
 
 ## 6. Reading the Output
 
+Example magnitudes match **Base**, **`-Amount 1000` speed**, **`cbBTC`** — **baseline / price** lines in **~10³ speed** for `refTokenStr` ≈ **0.00000333 cbBTC**. See `../LIVE-TEST-1000-SPEED.md`.
+
 ### Detection phase (pre-entry)
 
 ```
 [09:00:00] Warming up baseline window... (0/3 polls)
 [09:00:30] Warming up baseline window... (1/3 polls)
 [09:01:00] Warming up baseline window... (2/3 polls)
-[09:01:30] Price: 0.00042100 ETH  baseline: 0.00042367  drop: +0.6299%  trigger: 5.00%  (-4.3701% away)
-[09:02:00] Price: 0.00041800 ETH  baseline: 0.00042267  drop: +1.1047%  trigger: 5.00%  (-3.8953% away)
-[09:02:30] Price: 0.00040000 ETH  baseline: 0.00041967  drop: +4.6863%  trigger: 5.00%  (-0.3137% away)
-[09:03:00] Price: 0.00037900 ETH  baseline: 0.00041300  drop: +8.2324%  trigger: 5.00%  (+3.2324% away)
+[09:01:30] Price: 992.50 speed  baseline: 1001.20  drop: +0.87%  trigger: 5.00%  (-4.13% away)
+[09:02:00] Price: 985.20 speed  baseline: 998.40  drop: +1.32%  trigger: 5.00%  (-3.68% away)
+[09:02:30] Price: 952.00 speed  baseline: 992.10  drop: +4.04%  trigger: 5.00%  (-0.96% away)
+[09:03:00] Price: 915.00 speed  baseline: 985.50  drop: +7.15%  trigger: 5.00%  (+2.15% away)
 
-CRASH detected! Price dropped +8.2324% vs 3-poll baseline  (0.00041300 ETH -> 0.00037900 ETH)
+CRASH detected! Price dropped +7.15% vs 3-poll baseline  (985.50 speed -> 915.00 speed)
 ```
 
 **Field meanings (detection phase):**
 
 | Field | Description |
 |---|---|
-| `Price` | Current price in ETH |
+| `Price` | Current price in **base token** (default label `speed` when `-BaseToken speed`) |
 | `baseline` | Mean of the last `BaselinePolls` prices (excludes current poll) |
 | `drop: +X%` | Price dropped X% below the baseline |
 | `drop: -X%` | Price rose above baseline (negative = price going up) |
@@ -243,22 +260,22 @@ CRASH detected! Price dropped +8.2324% vs 3-poll baseline  (0.00041300 ETH -> 0.
 Same as `trailing-stop-any` output:
 
 ```
-[09:02:30] POST-ENTRY  0.00038500 ETH  peak: 0.00038500  floor: 0.00036575  (+0.0000% from peak)
-[09:03:00] POST-ENTRY  0.00039200 ETH  peak: 0.00039200  floor: 0.00037240  (+0.0000% from peak)
-[09:03:30] POST-ENTRY  0.00039000 ETH  peak: 0.00039200  floor: 0.00037240  (-0.5102% from peak)
+[09:02:30] POST-ENTRY  932.00 speed  peak: 932.00  floor: 885.40  (+0.0000% from peak)
+[09:03:00] POST-ENTRY  948.50 speed  peak: 948.50  floor: 901.08  (+0.0000% from peak)
+[09:03:30] POST-ENTRY  943.20 speed  peak: 948.50  floor: 901.08  (-0.5588% from peak)
 ```
 
 ---
 
 ## 7. P/L Interpretation
 
-**Entry cost:** `Amount` ETH
+**Entry cost:** `Amount` in **base token** (e.g. `speed` when `-BaseToken speed`)
 
-**Exit value:** ETH received from trailing stop sell
+**Exit value:** Base token received from trailing stop sell
 
 **Net P/L:**
 ```
-P/L % = (ethReceived − Amount) / Amount × 100
+P/L % = (baseReceived − Amount) / Amount × 100
 ```
 
 The crash entry typically results in buying at a price already below the pre-crash level. If the token recovers even partially, the trailing stop captures most of the bounce. If the crash continues (token trends down), the trailing stop eventually fires to limit the loss.

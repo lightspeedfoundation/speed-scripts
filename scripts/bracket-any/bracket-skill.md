@@ -1,3 +1,16 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+Spend/quote amounts (e.g. `-Amount`, `-TotalAmount`, `-BasePerGrid`, `-BasePerRung`) are in **units of the base token**. Use `../scripts/` if you want ETH-only bots unchanged.
+
+---
+
 # Bracket Order (OCO) Skill
 
 Complete reference for `bracket-any.ps1` and `bracket-any.sh` — One-Cancels-Other bracket order bots built on the `speed` CLI.
@@ -40,17 +53,19 @@ The first level to be hit fires the sell and exits the position. The other level
 
 ## 2. Parameters Reference
 
-| Parameter (PS1)  | Flag (SH)          | Type    | Default  | Description |
+| Parameter (PS1)     | Flag (SH)               | Type    | Default   | Description |
 |---|---|---|---|---|
-| `-Chain`         | `--chain`          | string  | required | Chain name or ID (`base`, `ethereum`, `arbitrum`, etc.) |
-| `-Token`         | `--token`          | string  | required | Token contract address or alias (`speed`). ETH is always the quote currency. |
-| `-Amount`        | `--amount`         | string  | required | ETH to spend on the initial buy. |
-| `-TakePct`       | `--take-pct`       | float   | required | % above the entry baseline to trigger the take-profit sell. |
-| `-StopPct`       | `--stop-pct`       | float   | required | % below the entry baseline to trigger the stop-loss sell. |
-| `-TokenSymbol`   | `--tokensymbol`    | string  | address  | Display label for the token in output. |
-| `-PollSeconds`   | `--pollseconds`    | integer | `60`     | Seconds between price polls. |
-| `-MaxIterations` | `--maxiterations`  | integer | `1440`   | Max polls before a forced market sell. |
-| `-DryRun`        | `--dry-run`        | switch  | off      | Log bracket levels and signals without buying or selling. |
+| `-Chain`            | `--chain`               | string  | required  | Chain name or ID (`base`, `ethereum`, `arbitrum`, etc.) |
+| `-Token`            | `--token`               | string  | required  | Token contract address or alias (`speed`). |
+| `-Amount`           | `--amount`              | string  | required  | **Base token** units to spend on the initial buy (same asset as `-BaseToken`). |
+| `-TakePct`          | `--take-pct`            | float   | required  | % above the entry baseline (in base returned) to trigger take-profit. |
+| `-StopPct`          | `--stop-pct`            | float   | required  | % below the entry baseline to trigger stop-loss. |
+| `-TokenSymbol`      | `--tokensymbol`         | string  | address   | Display label for the token in output. |
+| `-PollSeconds`      | `--pollseconds`         | integer | `60`      | Seconds between price polls. |
+| `-MaxIterations`    | `--maxiterations`       | integer | `1440`    | Max polls before a forced market sell. |
+| `-BaseToken`        | `--base-token`          | string  | `speed`   | Asset to spend and receive (e.g. `speed`, `eth`, or `0x…`). If equal to `-Token`, resolves to `eth`. |
+| `-BaseTokenSymbol`  | `--base-token-symbol`   | string  | *(empty)* | Display label for the base token in logs (e.g. show `SPEED` instead of `speed`). |
+| `-DryRun`           | `--dry-run`             | switch  | off       | Log bracket levels and signals without buying or selling. |
 
 ---
 
@@ -58,17 +73,19 @@ The first level to be hit fires the sell and exits the position. The other level
 
 ### Price oracle
 
-Price is measured as: **ETH returned for the fixed token amount** (`tokenStr`).
+Price is measured as: **base token returned for the fixed token amount** (`tokenStr`) — e.g. **~10²–10³ speed** for a normal **cbBTC** position on Base when **`-BaseToken speed`**, not micro-units like **0.01 speed**.
 
-`tokenStr` is determined at startup from the buy quote and remains constant throughout polling. A higher ETH return = higher price.
+`tokenStr` is determined at startup from the buy quote and remains constant throughout polling. A higher base return = higher price.
 
 ### Baseline
 
 ```
-baselineRaw = quote(tokenStr → ETH) immediately after the buy executes
+baselineRaw = quote(tokenStr → BaseToken) immediately after the buy executes
 ```
 
-The baseline represents what you could sell the position for right now, immediately after entry. It is typically slightly below `Amount` ETH due to spread and slippage.
+The baseline represents what you could sell the position for right now, immediately after entry. It is often a few percent below **`Amount`** base spent due to spread and slippage.
+
+**Mainnet-shaped example (Base, cbBTC, 1000 speed spent):** position ≈ **0.00000333 cbBTC** → baseline sell quote ≈ **997.05 speed** — see `../LIVE-TEST-1000-SPEED.md`.
 
 ### Bracket levels
 
@@ -77,11 +94,11 @@ takeTarget = baselineRaw × (1 + TakePct / 100)
 stopFloor  = baselineRaw × (1 − StopPct / 100)
 ```
 
-Both anchored to `baselineRaw`, not to `Amount` ETH spent. This means:
-- A 10% take-profit means you want 10% more ETH back than the post-buy baseline — not 10% more than you spent.
+Both anchored to `baselineRaw`, not to `Amount` base spent. This means:
+- A 10% take-profit means you want 10% more **base** back than the post-buy baseline — not 10% more than you spent.
 - A 5% stop-loss means you accept losing 5% from the post-buy baseline value.
 
-The actual P/L vs ETH spent will differ slightly due to entry slippage. The skill section on P/L interpretation covers how to calculate the real return.
+The actual P/L vs base spent will differ slightly due to entry slippage. The skill section on P/L interpretation covers how to calculate the real return.
 
 ### Risk/reward ratio
 
@@ -99,15 +116,16 @@ A minimum 2:1 R:R is recommended. Taking trades with 1:1 or worse requires a win
 
 ```
 Phase 1 — Buy
-  Execute: speed swap -c Chain --sell eth --buy Token -a Amount -y
+  Execute: speed swap -c Chain --sell BaseToken --buy Token -a Amount -y
+  (default BaseToken is speed; resolves to eth when Token is also the base)
 
 Phase 2 — Anchor
-  Quote tokenStr → ETH immediately after buy = baselineRaw
+  Quote tokenStr → BaseToken immediately after buy = baselineRaw
   takeTarget = baselineRaw × (1 + TakePct/100)
   stopFloor  = baselineRaw × (1 − StopPct/100)
 
 Phase 3 — Bracket monitoring
-  Each poll: quote tokenStr → ETH = currentRaw
+  Each poll: quote tokenStr → BaseToken = currentRaw
   If currentRaw >= takeTarget: TAKE-PROFIT → sell → exit
   If currentRaw <= stopFloor:  STOP-LOSS   → sell → exit
   MaxIterations reached:       TIMEOUT     → sell → exit
@@ -163,72 +181,81 @@ chmod +x bracket-any.sh
 
 ## 6. Reading the Output
 
+Digits below match a **dry-run** on Base (**cbBTC**, **1000 speed** spent, **+10% / −10%** bracket) — see `../LIVE-TEST-1000-SPEED.md`. Oracle values are **hundreds of speed**, not **10⁻⁴** (that scale was legacy **ETH**-style paste error).
+
 ### Setup block
+
+(Default base token is **speed**; labels follow `-BaseTokenSymbol` / `--base-token-symbol` when set.)
 
 ```
 === Speed Bracket Order (OCO) ===
   Chain         : base
   Token         : cbBTC  (decimals: 8)
-  ETH spent     : 0.012 ETH
-  Take-profit   : +5% above entry baseline
-  Stop-loss     : -3% below entry baseline
+  Base spent    : 1000 speed
+  Take-profit   : +10% above entry baseline
+  Stop-loss     : -10% below entry baseline
   Poll interval : 30 s
   Max polls     : 1440
 
-Step 3 - Baseline sell quote (cbBTC -> ETH)...
-  Baseline ETH back : 0.01176000 ETH
-  Take-profit target: 0.01234800 ETH  (baseline +5%)
-  Stop-loss floor   : 0.01140720 ETH  (baseline -3%)
+Step 3 - Baseline sell quote (cbBTC -> speed)...
+  Baseline speed back : 997.05035889 speed
+  Take-profit target: 1096.75539478 speed  (baseline +10%)
+  Stop-loss floor   : 897.34532300 speed  (baseline -10%)
 ```
 
 ### Polling phase
 
-```
-[09:21:01] Poll 3 / 1440 - waiting 30 s...
-[09:21:31] 0.01190000 ETH  (+1.1905% vs entry)  TP: -3.6400% away  SL: +4.3100% away  [take: 0.01234800  stop: 0.01140720]
-[09:22:01] Poll 4 / 1440 - waiting 30 s...
-[09:22:31] 0.01228000 ETH  (+4.4218% vs entry)  TP: -0.5500% away  SL: +7.6300% away  [take: 0.01234800  stop: 0.01140720]
+Actual lines match `bracket-any.ps1` / `bracket-any.sh` (same formulas):
 
-TAKE-PROFIT triggered! 0.01236000 ETH back  (+3.00% gain vs ETH spent)
->>> TAKE-PROFIT — Executing: speed swap -c base --sell 0xcbB7... --buy eth -a 0.00000457 -y
+```
+[22:57:10] Poll 1 / 1440 - waiting 30 s...
+[22:57:10] 997.05035889 speed  (0.0000% vs entry)  TP: +10.0000% to target  SL: 10.0000% cushion to floor  [take: 1096.75539478 speed  stop: 897.34532300 speed]
+```
+
+- **`TP: +X% to target`** — \((\texttt{takeTargetRaw} - \texttt{currentRaw}) / \texttt{currentRaw} \times 100\): how far **up** (in %) the quote must move from the current poll to hit take-profit. Near zero means close to TP.
+- **`SL: X% cushion to floor`** — \((\texttt{currentRaw} - \texttt{stopFloorRaw}) / \texttt{currentRaw} \times 100\): margin above the stop floor (as % of current); small or negative means stop is close or breached.
+
+```
+TAKE-PROFIT triggered! 1097.20 speed back  (+10.1% vs baseline)
+>>> TAKE-PROFIT - Executing: speed swap -c base --sell 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf --buy speed -a 0.00000333 -y
 ```
 
 **Field meanings:**
 
 | Field | Description |
 |---|---|
-| `ETH back` | Current ETH return for the held position |
-| `% vs entry` | Gain/loss vs the post-buy baseline |
-| `TP: X% away` | Positive = above take-profit (triggered). Negative = below take-profit (gap remaining). |
-| `SL: X% away` | Positive = above stop-loss floor (safe). Negative = below stop-loss (triggered). |
-| `[take / stop]` | Absolute ETH values of both levels for reference |
-| Color green | Price at or above take-profit — fires |
-| Color red | Price at or below stop-loss — fires |
-| Color yellow | Within 25% of take-profit distance |
-| Color dark red | Within 25% of stop-loss distance |
-| Color white | Safely between both levels |
+| Base amount (first column) | Current **base token** return for the full `tokenStr` position |
+| `% vs entry` | Gain/loss vs the post-buy **baseline** (not vs amount spent) |
+| `TP: … to target` | Percent move from current quote toward take-profit (see formula above) |
+| `SL: … cushion to floor` | Percent of current quote above the stop floor (see formula above) |
+| `[take: … stop: …]` | Absolute base values of both bracket levels |
+| Color green | At or above take-profit — take-profit fires |
+| Color red | At or below stop-loss — stop-loss fires |
+| Color yellow | Within 25% of the distance from baseline to take-profit |
+| Color dark red | Within 25% of the distance from baseline to stop floor |
+| Color white | Between both inner zones |
 
 ---
 
 ## 7. P/L Interpretation
 
-**Entry cost:** `Amount` ETH spent
+**Entry cost:** `Amount` in **base token** units spent
 
-**Exit value:** ETH received from whichever level fires
+**Exit value:** Base token received when the sell swap completes
 
 **Net P/L:**
 ```
-P/L % = (ethReceived − Amount) / Amount × 100
+P/L % = (baseReceived − Amount) / Amount × 100
 ```
 
-**Note on baseline vs. Amount:** The take-profit and stop-loss are anchored to `baselineRaw` (post-buy sell quote), not `Amount`. If entry slippage is 1% (baseline = 0.99 × Amount), then:
+**Note on baseline vs. Amount:** The take-profit and stop-loss are anchored to `baselineRaw` (post-buy sell quote), not `Amount`. If entry slippage is 1% (baseline ≈ 0.99 × Amount in base terms), then:
 
-| Scenario | TakePct | ETH received (approx) | P/L vs Amount |
+| Scenario | TakePct | Base received (approx) | P/L vs Amount |
 |---|---|---|---|
 | TP fires | 10% | 0.99 × 1.10 × Amount = 1.089 × Amount | +8.9% |
 | SL fires | -5% | 0.99 × 0.95 × Amount = 0.940 × Amount | -6.0% |
 
-The console output shows `% gain vs ETH spent` at the moment of firing for the actual realized number.
+The console shows **`% gain vs base spent`** (take-profit) or **`% vs base spent`** (stop-loss) at trigger time — that is P/L vs **Amount**, not vs baseline.
 
 **Risk/reward in practice (1% entry slippage, 1:2 R:R TakePct=10, StopPct=5):**
 ```
@@ -243,7 +270,7 @@ Required win rate to break even: ~40%
 
 | Pitfall | Details | Fix |
 |---|---|---|
-| Baseline is not Amount | Post-buy baseline is typically 1–2% below Amount due to slippage. Both levels are anchored to baseline, not Amount. | Account for slippage when choosing TakePct/StopPct. Use DryRun first to observe the exact baseline. |
+| Baseline is not Amount | Post-buy baseline is typically 1–2% below **Amount** (in base) due to slippage. Both levels are anchored to baseline, not Amount. | Account for slippage when choosing TakePct/StopPct. Use DryRun first to observe the exact baseline. |
 | Stop fires immediately | If the token has high spread (5%+), the baseline may be far below Amount and the stop could fire on the first poll. | For high-spread tokens, increase StopPct or widen the bracket. Run DryRun to see baseline first. |
 | Bracket doesn't adapt | Unlike a trailing stop, bracket levels are fixed at entry. If price moves strongly in your favor but then reverses, the TP may not have fired before the reversal. | For trending moves, prefer trailing stop. Bracket is best for range-bound, mean-reverting conditions. |
 | MaxIterations with a losing position | On timeout, the script sells at market regardless of level. If price is between levels at timeout, you exit at current market price. | Set MaxIterations appropriately for your expected holding period. 1440 polls × 60s = 24 hours. |

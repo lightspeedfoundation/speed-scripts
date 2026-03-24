@@ -1,3 +1,16 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+Spend/quote amounts (e.g. `-Amount`, `-TotalAmount`, `-BasePerGrid`, `-BasePerRung`) are in **units of the base token**. Use `../scripts/` if you want ETH-only bots unchanged.
+
+---
+
 # Hybrid Exit Skill
 
 Complete reference for `hybrid-exit-any.ps1` and `hybrid-exit-any.sh` — the highest Sharpe exit structure in the suite, combining a fixed partial take-profit with a trailing stop on the remainder.
@@ -45,13 +58,15 @@ The fixed first sell eliminates the "gave back all gains" scenario. The trailing
 | Parameter (PS1)  | Flag (SH)           | Type    | Default  | Description |
 |---|---|---|---|---|
 | `-Chain`         | `--chain`           | string  | required | Chain name or ID (`base`, `ethereum`, `arbitrum`, etc.) |
-| `-Token`         | `--token`           | string  | required | Token contract address or alias (`speed`). ETH is always the quote currency. |
-| `-Amount`        | `--amount`          | string  | required | ETH to spend on the initial buy. |
+| `-Token`         | `--token`           | string  | required | Token contract address or alias (`speed`, `cbBTC`, …). |
+| `-Amount`        | `--amount`          | string  | required | Base token to spend on the initial buy (same units as `speed swap -a`). |
+| `-BaseToken`     | `--base-token`      | string  | `speed`  | Quote token address or alias (`speed`, `eth`, …). |
+| `-BaseTokenSymbol` | `--base-token-symbol` | string | (optional) | Display label for the base token in logs. |
 | `-TakePct`       | `--take-pct`        | float   | required | % above baseline to trigger the first partial sell. |
 | `-ExitFraction`  | `--exit-fraction`   | float   | `50`     | % of position to sell at the take target. Valid: 1-99. Remainder is `100 - ExitFraction`. |
 | `-TrailPct`      | `--trail-pct`       | float   | `5`      | Trailing stop % applied to the remainder after partial exit. |
 | `-StopPct`       | `--stop-pct`        | float   | `10`     | Hard stop: % below baseline triggering full sell (Phase A) or remainder sell (Phase C). |
-| `-TokenSymbol`   | `--tokensymbol`     | string  | address  | Display label for the token in output. |
+| `-TokenSymbol`   | `--tokensymbol`     | string  | `""`     | Optional display label for the token. |
 | `-PollSeconds`   | `--pollseconds`     | integer | `60`     | Seconds between price polls. |
 | `-MaxIterations` | `--maxiterations`   | integer | `1440`   | Max total polls (Phase A + Phase C). Falls back to market sell on timeout. |
 | `-DryRun`        | `--dry-run`         | switch  | off      | Simulate all phases without executing any swaps. |
@@ -62,7 +77,7 @@ The fixed first sell eliminates the "gave back all gains" scenario. The trailing
 
 ### Baseline
 
-`baselineRaw` = post-buy sell quote for `refTokenStr` → ETH. This is the anchor for all exit levels, consistent with `bracket-any` and `trailing-stop-any`.
+`baselineRaw` = post-buy sell quote for `refTokenStr` → **BaseToken**. This is the anchor for all exit levels, consistent with `bracket-any` and `trailing-stop-any`.
 
 ### Phase A levels
 
@@ -83,7 +98,7 @@ partialTokenStr   = refTokenStr * (ExitFraction / 100)
 remainderTokenStr = refTokenStr * (1 - ExitFraction / 100)
 
 Sell partialTokenStr at market.
-Anchor trail on remainder: peakRaw = quote(remainderTokenStr -> ETH)
+Anchor trail on remainder: peakRaw = quote(remainderTokenStr -> BaseToken)
 ```
 
 ### Phase C levels
@@ -101,14 +116,14 @@ Each poll:
 
 ```
 Phase A win (partial):
-  profit_A = (takeTargetETH - Amount * partialFrac) / (Amount * partialFrac)
+  profit_A = (takeTargetBase - Amount * partialFrac) / (Amount * partialFrac)
 
 Phase C outcome depends on how far the trail runs:
   best:  trail fires near the post-take peak
   worst: trail fires immediately at floorRaw (= peakRaw * (1 - TrailPct/100))
 
 Combined P/L approximation:
-  P/L = (ethFromPartialSell + ethFromRemainderSell - Amount) / Amount * 100
+  P/L = (baseFromPartialSell + baseFromRemainderSell - Amount) / Amount * 100
 ```
 
 ---
@@ -117,28 +132,28 @@ Combined P/L approximation:
 
 ```
 Step 1 — Buy
-  Quote Amount ETH -> Token (preview)
-  Execute: speed swap --sell eth --buy Token -a Amount -y
+  Quote Amount BaseToken -> Token (preview)
+  Execute: speed swap --sell BaseToken --buy Token -a Amount -y
   
 Step 2 — Baseline quote
-  Quote refTokenStr -> ETH = baselineRaw
+  Quote refTokenStr -> BaseToken = baselineRaw
   Compute: takeTargetRaw, stopThreshRaw, partialTokenStr, remainderTokenStr
   Display all levels
 
 Step 3 — Phase A: poll loop
-  Each poll: quote refTokenStr -> ETH
+  Each poll: quote refTokenStr -> BaseToken
     If currentRaw <= stopThreshRaw: HARD STOP -> sell full refTokenStr, exit
     If currentRaw < takeTargetRaw:  display progress, continue
     If currentRaw >= takeTargetRaw: TAKE TARGET reached -> Phase B
 
   Phase B (inline):
     Sell partialTokenStr at market
-    Quote remainderTokenStr -> ETH = peakRaw
+    Quote remainderTokenStr -> BaseToken = peakRaw
     Set floorRaw = peakRaw * (1 - TrailPct/100)
     phase_b_done = true
 
   Phase C (same loop, phaseB_done = true):
-    Each poll: quote remainderTokenStr -> ETH
+    Each poll: quote remainderTokenStr -> BaseToken
     Hard stop on remainder: if rRaw <= stopThreshRaw * remainderFrac -> sell, exit
     Update peak/floor if new high
     If rRaw <= floorRaw: TRAIL fires -> sell remainderTokenStr, exit
@@ -202,19 +217,21 @@ chmod +x hybrid-exit-any.sh
 
 ## 6. Reading the Output
 
+Example magnitudes match **Base**, **`-Amount 1000` speed**, **`cbBTC`**: Phase-A **price / baseline** in **~10³ speed** (same family as **~997** full-position quotes in `../LIVE-TEST-1000-SPEED.md`).
+
 ### Phase A (watching for take target)
 
 ```
-[09:01:00] PHASE-A  price: 0.00044000 ETH  baseline: 0.00042000  (+4.7619% vs baseline)  take: +10%  (+5.2381% away)
-[09:02:00] PHASE-A  price: 0.00045200 ETH  baseline: 0.00042000  (+7.6190% vs baseline)  take: +10%  (+2.3810% away)
-[09:03:00] PHASE-A  price: 0.00046400 ETH  baseline: 0.00042000  (+10.4762% vs baseline)  take: +10%  (+0.4762% away)
+[09:01:00] PHASE-A  price: 1045.00 speed  baseline: 997.05  (+4.81% vs baseline)  take: +10%  (+5.19% away)
+[09:02:00] PHASE-A  price: 1073.00 speed  baseline: 997.05  (+7.62% vs baseline)  take: +10%  (+2.38% away)
+[09:03:00] PHASE-A  price: 1096.80 speed  baseline: 997.05  (+10.00% vs baseline)  take: +10%  (+0.00% away)
 
-Take target reached! 0.00046400 ETH  (+10.4762% vs baseline)
-Selling 50% of position (0.023810 TOKEN)...
+Take target reached! 1096.80 speed  (+10.00% vs baseline)
+Selling 50% of position (0.00000167 cbBTC)...
 ```
 
 **Fields:**
-- `price` — current ETH return for the full reference position
+- `price` — current base-token return for the full reference position
 - `baseline` — the post-buy anchor price
 - `(+X% vs baseline)` — how far above baseline current price is
 - `take: +X%` — the required take-profit level
@@ -225,22 +242,22 @@ Color: gray = below baseline, white = above baseline but below 50% of target, ye
 ### Phase C (trailing the remainder)
 
 ```
-[09:04:00] PHASE-C  remainder: 0.00023400 ETH  peak: 0.00023400  floor: 0.00022230  (+0.0000% from peak)
-[09:05:00] PHASE-C  remainder: 0.00024100 ETH  peak: 0.00024100  floor: 0.00022895  (+0.0000% from peak)
-[09:06:00] PHASE-C  remainder: 0.00023200 ETH  peak: 0.00024100  floor: 0.00022895  (-3.7344% from peak)
+[09:04:00] PHASE-C  remainder: 548.50 speed  peak: 548.50  floor: 521.08  (+0.0000% from peak)
+[09:05:00] PHASE-C  remainder: 562.20 speed  peak: 562.20  floor: 534.09  (+0.0000% from peak)
+[09:06:00] PHASE-C  remainder: 528.00 speed  peak: 562.20  floor: 534.09  (-6.08% from peak)
 
-Trail floor breached! Remainder: 0.00022800 ETH back
+Trail floor breached! Remainder: 526.80 speed back
 ```
 
 ---
 
 ## 7. P/L Interpretation
 
-**Entry cost:** `Amount` ETH
+**Entry cost:** `Amount` in **base token**
 
-**Phase A exit:** ETH received from the partial sell (`ExitFraction%` of position at `TakePct%` above baseline). This portion is always profitable if take target is reached before hard stop.
+**Phase A exit:** Base token received from the partial sell (`ExitFraction%` of position at `TakePct%` above baseline). This portion is always profitable if take target is reached before hard stop.
 
-**Phase C exit:** ETH received from the remainder sell. Outcome range:
+**Phase C exit:** Base token received from the remainder sell. Outcome range:
 - Best: price continued rising after Phase B; trail fires near a new peak
 - Neutral: price stalled at the take target; trail fires near `peakRaw` (same level as the take target)
 - Worst: price reversed immediately after partial sell; hard stop fires on remainder at `StopPct%` below baseline
@@ -249,7 +266,7 @@ Trail floor breached! Remainder: 0.00022800 ETH back
 
 ```
 Required for break-even =
-  (Amount - partial_ETH_received) / remainderFrac
+  (Amount - partial_base_received) / remainderFrac
 ```
 
 If Phase A sold 50% at +10%, the remainder only needs to recover the original entry cost on its 50% share to break even overall — which means Phase C can fire at a loss on the remainder and the overall trade still profits.
@@ -264,4 +281,4 @@ If Phase A sold 50% at +10%, the remainder only needs to recover the original en
 | Partial sell then hard stop on remainder | It's possible to lock in profit on the first half but then lose more than that on the remainder via the hard stop. | Keep `ExitFraction` >= 50 to ensure the locked profit covers a worst-case remainder loss. |
 | Take target too tight | If `TakePct` is smaller than normal price oscillation, the take fires on the first bounce rather than a genuine move. | Set `TakePct` wider than your observed typical noise range. |
 | Trail too tight on remainder | If `TrailPct` < typical volatility, the trail fires on the first normal dip after Phase B. | Use a wider `TrailPct` for the remainder than you would for a single-position trail, since the remainder represents smaller capital. |
-| TokenAmount rounding | Token amounts are computed from the buy preview quote, not the actual fill. Actual received tokens may differ slightly. | The scripts use `refTokenStr` from the buy preview throughout, which mirrors `trailing-stop-any`'s approach. |
+| TokenAmount rounding | Preview vs fill: estimated tokens can differ from executed fill. | **PowerShell** anchors `refTokenStr` to the **buy preview** (`estTokenRaw`) for the whole run. **Bash** re-resolves `ref_token_raw` from the **actual swap** JSON via `speed_v2_parse_swap_buy_raw` when available, so it tracks executed size more closely. |

@@ -1,6 +1,6 @@
 # Trading Scripts Reference
 
-Concise function reference for all trading bots. Each script runs standalone — `Chain`, `Token`, and `Amount` (or equivalent) are always required. All scripts support `-DryRun` unless noted. All use ETH as the quote currency.
+Concise function reference for all trading bots. Each script runs standalone — `Chain`, `Token`, and `Amount` (or equivalent) are always required. Most scripts support `-DryRun` unless noted. Scripts are v2-style: base token is configurable (`-BaseToken` / `--base-token`) and defaults to `speed` unless a script specifies otherwise.
 
 ---
 
@@ -8,9 +8,9 @@ Concise function reference for all trading bots. Each script runs standalone —
 
 These scripts execute an immediate buy and then manage the exit autonomously.
 
-**`trailing-stop-any`** — Buy immediately, then trail a stop below the running ETH-return peak. `TrailPct` sets the floor offset below peak. Floor only moves up; never resets down. Sells when ETH return drops below floor. No take-profit target — pure peak protection. The simplest production-ready bot.
+**`trailing-stop-any`** — Buy immediately, then trail a stop below the running base-token return peak. `TrailPct` sets the floor offset below peak. Floor only moves up; never resets down. Sells when base-token return drops below floor. No take-profit target — pure peak protection. The simplest production-ready bot.
 
-**`limit-order-any`** — Buy immediately, then poll until ETH return >= original ETH * (1 + `TargetPct`/100). Single fixed target, no trailing. Falls back to market sell after `MaxIterations`. Success is measured in ETH, not token price. The baseline for all fixed-target strategies.
+**`limit-order-any`** — Buy immediately, then poll until base-token return >= original base spent * (1 + `TargetPct`/100). Single fixed target, no trailing. Falls back to market sell after `MaxIterations`. Success is measured in base-token P/L, not token price. The baseline for all fixed-target strategies.
 
 **`bracket-any`** — Buy immediately, then hold a take-profit ceiling (`TakePct`) and stop-loss floor (`StopPct`) simultaneously. Both levels anchored to `baselineRaw` (post-buy sell quote). First level to fire executes the sell; the other cancels implicitly. DryRun prints exact baseline, take, and stop levels before committing. OCO logic — no trailing, no drift.
 
@@ -24,7 +24,7 @@ These scripts execute an immediate buy and then manage the exit autonomously.
 
 These scripts do NOT buy immediately. They wait for a signal condition, then enter and manage the exit.
 
-**`momentum-any`** — Warm-up phase builds a rolling price window of `WindowPolls` polls. Monitoring phase fires a buy only when price breaks above the window high by `BreakoutPct`%. Post-entry exit is a trailing stop (`TrailPct`). Never spends ETH without a confirmed breakout. DryRun lets you observe window and breakout signals without committing. Trend-following regime. Optional `-VolumeConfirm` flag adds a pool depth check before any entry: quotes `Amount` vs `Amount * VolumeMultiple` ETH and rejects the breakout signal if implied price impact exceeds `MaxImpactPct`% — filters thin-pool wicks.
+**`momentum-any`** — Warm-up phase builds a rolling price window of `WindowPolls` polls. Monitoring phase fires a buy only when price breaks above the window high by `BreakoutPct`%. Post-entry exit is a trailing stop (`TrailPct`). Never spends base token without a confirmed breakout. DryRun lets you observe window and breakout signals without committing. Trend-following regime. Optional `-VolumeConfirm` flag adds a pool depth check before any entry: quotes `Amount` vs `Amount * VolumeMultiple` base units and rejects the breakout signal if implied price impact exceeds `MaxImpactPct`% — filters thin-pool wicks.
 
 **`mean-revert-any`** — Continuously recalculates a rolling mean. Buys when price drops `DipPct`% below the rolling mean. Exit is either mean-recovery (`RecoverPct`% above entry) or a trailing stop (`TrailPct`) — whichever fires first. Hard stop-loss (`StopPct`) always active. Mean recomputes every poll — entry zones shift with the market. Pair with `momentum-any` on the same token for full two-regime coverage. Optional `-TimeStopMinutes`: if elapsed time exceeds the limit after warm-up, exits cleanly without a trade if no entry was made, or sells at market if holding a position.
 
@@ -38,11 +38,11 @@ These scripts do NOT buy immediately. They wait for a signal condition, then ent
 
 These scripts do NOT take a fixed amount. They accumulate a position over time via rules.
 
-**`ladder-buy-any`** — Builds N buy trigger levels below the current baseline price, spaced `RungSpacingPct`% apart. Each time price dips to a rung, buys `EthPerRung` ETH. Tracks the full accumulated position. `-TrailAfterN` switches into a trailing stop on the total accumulated position once N rungs have filled — does not require all rungs. `-TrailAfterN 2` on a 4-rung ladder starts trailing after the second fill, regardless of whether rungs 3-4 ever trigger. `-TrailAfterFilled` is kept as a backward-compatible alias (equivalent to `-TrailAfterN $Rungs`). Static baseline — rungs are set once at start and do not drift with the market.
+**`ladder-buy-any`** — Builds N buy trigger levels below the current baseline price, spaced `RungSpacingPct`% apart. Each time price dips to a rung, buys `BasePerRung` base units. Tracks the full accumulated position. `-TrailAfterN` switches into a trailing stop on the total accumulated position once N rungs have filled — does not require all rungs. `-TrailAfterN 2` on a 4-rung ladder starts trailing after the second fill, regardless of whether rungs 3-4 ever trigger. `-TrailAfterFilled` is kept as a backward-compatible alias (equivalent to `-TrailAfterN $Rungs`). Static baseline — rungs are set once at start and do not drift with the market.
 
-**`grid-trade-any`** — Places N grid cells below current price, each spaced `GridPct`% apart. Buys `EthPerGrid` ETH when price reaches a cell's buy level. Sells each filled cell individually when price recovers one grid step. Processes sells before buys each poll. Prints a live grid status table and running P&L after every poll. Designed for oscillating/ranging markets with no directional bias. Exits all filled cells at `MaxIterations`.
+**`grid-trade-any`** — Places N grid cells below current price, each spaced `GridPct`% apart. Buys `BasePerGrid` base units when price reaches a cell's buy level. Sells each filled cell individually when price recovers one grid step. Processes sells before buys each poll. Prints a live grid status table and running P&L after every poll. Designed for oscillating/ranging markets with no directional bias. Exits all filled cells at `MaxIterations`.
 
-**`value-average-any`** — On each interval, raises a target portfolio value by `TargetIncrement` ETH. Buys the deficit (current value below target). Optional `-AllowSell` trims the surplus when current value exceeds target. `MaxBuyPerInterval` caps runaway buys. Buys more when price is low (large deficit) and less when high — natural inverse price sensitivity. Runs for `Intervals` intervals then prints a final summary.
+**`value-average-any`** — On each interval, raises a target portfolio value by `TargetIncrement` base units. Buys the deficit (current value below target). Optional `-AllowSell` trims the surplus when current value exceeds target. `MaxBuyPerInterval` caps runaway buys. Buys more when price is low (large deficit) and less when high — natural inverse price sensitivity. Runs for `Intervals` intervals then prints a final summary.
 
 ---
 
@@ -50,9 +50,15 @@ These scripts do NOT take a fixed amount. They accumulate a position over time v
 
 These scripts have no strategy. They are execution quality tools — use them to reduce timing risk and market impact on large positions.
 
-**`twap-buy-any`** — Splits a fixed `TotalAmount` of ETH into `N` equal slices and executes one buy per `IntervalSeconds`. No signal, no condition — every slice fires on schedule. Prints average price, price range, and per-slice variance at the end. Use when entering a large position where a single market buy would cause meaningful slippage.
+**`twap-buy-any`** — Splits a fixed `TotalAmount` of base token into `N` equal slices and executes one buy per `IntervalSeconds`. No signal, no condition — every slice fires on schedule. Prints average price, price range, and per-slice variance at the end. Use when entering a large position where a single market buy would cause meaningful slippage.
 
-**`twap-sell-any`** — No initial buy. Operates on an existing token position — takes `TokenAmount` directly (run `speed balance` first). Splits into `N` equal sell slices over `IntervalSeconds`. Tracks best and worst slice. Prints total ETH received, average price, and slice performance summary. Pure exit tool — reduces market impact when liquidating a large position.
+**`twap-sell-any`** — No initial buy. Operates on an existing token position — takes `TokenAmount` directly (run `speed balance` first). Splits into `N` equal sell slices over `IntervalSeconds`. Tracks best and worst slice. Prints total base received, average price, and slice performance summary. Pure exit tool — reduces market impact when liquidating a large position.
+
+---
+
+## Quote-Only Watchers
+
+**`market-watch-any`** — Builds a reference token amount from a one-time `BaseToken -> Token` quote using `Amount`, then continuously polls `Token -> BaseToken` and prints live value, `% vs baseline`, and session high/low. No swaps, no approvals, no position changes.
 
 ---
 

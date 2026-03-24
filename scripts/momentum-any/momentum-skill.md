@@ -1,3 +1,16 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+Spend/quote amounts (e.g. `-Amount`, `-TotalAmount`, `-BasePerGrid`, `-BasePerRung`) are in **units of the base token**. Use `../scripts/` if you want ETH-only bots unchanged.
+
+---
+
 # Momentum Buy Skill
 
 Complete reference for `momentum-any.ps1` and `momentum-any.sh` — momentum breakout entry bots built on the `speed` CLI.
@@ -34,7 +47,7 @@ Momentum trading only enters a position when a trend is already confirmed — sp
 
 **Key difference from `limit-order-any`:** A limit order buys at a specific price level (a dip). Momentum buys when price is at a *new high* — when the market is showing strength, not weakness.
 
-**If no breakout occurs:** The script exits cleanly at `MaxIterations` without having spent any ETH.
+**If no breakout occurs:** The script exits cleanly at `MaxIterations` without having spent any base token.
 
 ---
 
@@ -43,12 +56,17 @@ Momentum trading only enters a position when a trend is already confirmed — sp
 | Parameter (PS1)   | Flag (SH)         | Type   | Default | Description |
 |---|---|---|---|---|
 | `-Chain`          | `--chain`         | string | required | Chain name or ID (`base`, `ethereum`, `arbitrum`, etc.) |
-| `-Token`          | `--token`         | string | required | Token contract address or alias (`speed`). ETH is always the quote currency. |
-| `-Amount`         | `--amount`        | string | required | ETH to spend when a breakout is confirmed. |
+| `-Token`          | `--token`         | string | required | Token contract address or alias (`speed`, `cbBTC`, …). |
+| `-Amount`         | `--amount`        | string | required | **Base token** to spend when a breakout is confirmed. |
+| `-BaseToken`      | `--base-token`    | string | `speed`  | Quote asset for pricing and swaps (`speed`, `eth`, …). |
+| `-BaseTokenSymbol`| `--base-token-symbol` | string | *(empty)* | Display label for base in logs. |
 | `-WindowPolls`    | `--window-polls`  | integer | `20`   | Number of polls in the rolling price window. Also controls warm-up length. |
-| `-BreakoutPct`    | `--breakout-pct`  | float  | `0`     | % above the window high required to confirm a breakout. `0` = any new high triggers. |
+| `-BreakoutPct`    | `--breakout-pct`  | float  | `0.5`   | % above the window high required to confirm a breakout. `0` = any new high triggers. |
 | `-TrailPct`       | `--trail-pct`     | float  | `5`     | Trailing stop % applied after buy entry. |
-| `-TokenSymbol`    | `--tokensymbol`   | string | address | Display label for the token in output. |
+| `-VolumeConfirm`  | `--volume-confirm` | switch | off | If set, require a **liquidity / impact** check before entering (see below). |
+| `-VolumeMultiple` | `--volume-multiple` | float | `10` | Size multiplier for the large test quote vs `-Amount` (pool depth check). |
+| `-MaxImpactPct`   | `--max-impact-pct` | float | `5` | Reject breakout if implied price impact exceeds this % at the large test size. |
+| `-TokenSymbol`    | `--tokensymbol`   | string | `""` | Optional display label for the token. |
 | `-PollSeconds`    | `--pollseconds`   | integer | `60`   | Seconds between price polls. |
 | `-MaxIterations`  | `--maxiterations` | integer | `1440` | Max total polls (watch + hold). If no breakout by this limit, exits without trading. |
 | `-DryRun`         | `--dry-run`       | switch | off     | Log breakout signals without buying. Trailing stop simulation also skipped. |
@@ -59,9 +77,9 @@ Momentum trading only enters a position when a trend is already confirmed — sp
 
 ### Price oracle
 
-Price is measured as: **ETH returned for a fixed reference token amount** (`refTokenStr`).
+Price is measured as: **base token returned for a fixed reference token amount** (`refTokenStr`).
 
-`refTokenStr` is determined once at startup by quoting `Amount` ETH → Token. The same amount is used throughout both phases. A higher ETH return = higher price.
+`refTokenStr` is determined once at startup by quoting `Amount` **BaseToken** → Token. The same reference size is used throughout both phases. A higher base return = higher price.
 
 ### Rolling window
 
@@ -81,18 +99,22 @@ breakoutThresh = windowHighRaw × (1 + BreakoutPct / 100)
 Breakout fires when: currentRaw >= breakoutThresh
 ```
 
-With `BreakoutPct = 0`: fires the moment price reaches a new window high.
+With `BreakoutPct = 0`: fires the moment price reaches a new window high (must pass `-BreakoutPct 0` explicitly; PS1 default is `0.5`).
 With `BreakoutPct = 1`: fires only when price exceeds the window high by at least 1% — avoids false signals at exact high touches.
+
+### Volume confirm (optional)
+
+When `-VolumeConfirm` is set, before buying the script compares quotes for **`-Amount`** vs **`Amount × VolumeMultiple`** of **BaseToken** into **Token**. Large divergence implies high price impact / thin liquidity; if implied impact exceeds `-MaxImpactPct`, the breakout is **skipped** and the script keeps watching.
 
 ### Post-entry trailing stop
 
 After the breakout buy executes:
 
 ```
-peakRaw  = quote(refTokenStr → ETH) immediately after buy
+peakRaw  = quote(refTokenStr → BaseToken) immediately after buy
 floorRaw = peakRaw × (1 − TrailPct / 100)
 
-Each poll: re-quote refTokenStr → ETH
+Each poll: re-quote refTokenStr → BaseToken
   If currentRaw > peakRaw: peak and floor rise
   If currentRaw ≤ floorRaw: sell immediately
 ```
@@ -122,11 +144,11 @@ Phase 2 — Monitoring
   Breakout detected → Phase 3
 
 Phase 3 — Entry
-  Execute: speed swap -c Chain --sell eth --buy Token -a Amount -y
+  Execute: speed swap -c Chain --sell BaseToken --buy Token -a Amount -y
   Quote post-buy price to anchor trailing stop peak
 
 Phase 4 — Trailing stop
-  Each poll: re-quote refTokenStr → ETH
+  Each poll: re-quote refTokenStr → BaseToken
   Update peak if new high
   Sell if below floor (peakRaw × (1 - TrailPct/100))
   MaxIterations reached → sell at market
@@ -184,38 +206,40 @@ chmod +x momentum-any.sh
 
 ## 6. Reading the Output
 
+Example magnitudes match **Base**, **`-Amount 1000` speed**, **`cbBTC`**, **`refTokenStr` ≈ 0.00000333 cbBTC** — oracle lines are **~10³ speed**, not ETH-style fractions. See `../LIVE-TEST-1000-SPEED.md`.
+
 ### Warm-up phase
 
 ```
 [09:00:01] Warm-up 1/19 - waiting 60 s...
-[09:01:01] Price: 0.00001850 ETH  window high: 0.00001900  (-2.63% vs high)  [2 samples]
+[09:01:01] Price: 982.40 speed  window high: 990.10  (-0.78% vs high)  [2 samples]
 [09:02:01] Warm-up 2/19 - waiting 60 s...
-[09:02:31] Price: 0.00001872 ETH  window high: 0.00001900  (-1.47% vs high)  [3 samples]
+[09:02:31] Price: 988.20 speed  window high: 990.10  (-0.19% vs high)  [3 samples]
 ...
-Warm-up complete. Window high: 0.00001920 ETH  (20 polls)
-Breakout threshold: 0.00001939 ETH  (window high + 1%)
+Warm-up complete. Window high: 997.05 speed  (20 polls)
+Breakout threshold: 1007.02 speed  (window high + 1%)
 ```
 
 ### Monitoring phase (pre-entry)
 
 ```
 [09:20:01] Poll 1 / 1440 - waiting 60 s...
-[09:21:01] Price: 0.00001915 ETH  win-high: 0.00001920  (-0.2604%)  thresh: -1.2346% away
+[09:21:01] Price: 994.20 speed  win-high: 997.05  (-0.2860%)  thresh: -1.2140% away
 [09:22:01] Poll 2 / 1440 - waiting 60 s...
-[09:22:31] Price: 0.00001945 ETH  win-high: 0.00001945  (+0.0000%)  thresh: -0.9901% away
+[09:22:31] Price: 1001.80 speed  win-high: 1001.80  (+0.0000%)  thresh: -0.5236% away
 
-BREAKOUT detected! Price 0.00001962 ETH >= threshold 0.00001939 ETH  (+2.2% vs window high)
+BREAKOUT detected! Price 1008.50 speed >= threshold 1007.02 speed  (+1.15% vs window high)
 ```
 
 ### Post-entry trailing stop
 
 ```
-[09:35:01] POST-ENTRY — 0.00002100 ETH  peak: 0.00002100  floor: 0.00001995  (+0.0000% from peak)
-[09:36:01] POST-ENTRY — 0.00002050 ETH  peak: 0.00002100  floor: 0.00001995  (-2.3810% from peak)
-[09:37:01] POST-ENTRY — 0.00001988 ETH  peak: 0.00002100  floor: 0.00001995  (-5.3333% from peak)
+[09:35:01] POST-ENTRY — 1045.00 speed  peak: 1045.00  floor: 992.75  (+0.0000% from peak)
+[09:36:01] POST-ENTRY — 1020.50 speed  peak: 1045.00  floor: 992.75  (-2.3445% from peak)
+[09:37:01] POST-ENTRY — 988.00 speed  peak: 1045.00  floor: 992.75  (-5.4545% from peak)
 
-Trail floor breached! 0.00001988 ETH back  (+1.84% vs entry cost)
->>> speed swap -c base --sell speed --buy eth -a 98000.00 SPEED -y
+Trail floor breached! 988.00 speed back  (+2.1% vs entry cost)
+>>> speed swap -c base --sell <Token> --buy <BaseToken> -a <tokenAmt> -y
 ```
 
 **Field meanings:**
@@ -237,13 +261,13 @@ Trail floor breached! 0.00001988 ETH back  (+1.84% vs entry cost)
 
 ## 7. P/L Interpretation
 
-**Entry cost:** `Amount` ETH
+**Entry cost:** `Amount` in **base token**
 
-**Exit value:** ETH received from trailing stop sell
+**Exit value:** Base token received from trailing stop sell
 
 **Net P/L:**
 ```
-P/L % = (ethReceived − Amount) / Amount × 100
+P/L % = (baseReceived − Amount) / Amount × 100
 ```
 
 The trailing stop ensures the minimum loss is capped at `TrailPct%` of the post-entry peak value. If price rises after entry, the floor rises with it, locking in a portion of the gain.
@@ -261,5 +285,5 @@ The trailing stop ensures the minimum loss is capped at `TrailPct%` of the post-
 | Warm-up time is long | 20 polls at 60 s each = 19 minutes before any entry is possible. | Reduce `WindowPolls` or `PollSeconds` for faster entry. Trade-off: more false signals. |
 | No breakout ever occurs | Token moves sideways or down. Script exits at `MaxIterations` without a trade. | No capital lost. Extend `MaxIterations` or restart script. |
 | Price drops right after breakout entry | The trailing stop fires at `peakRaw × (1 - TrailPct/100)`. Peak is anchored from the post-buy quote, not the breakout price. | Normal. Widen `TrailPct` if the token is very volatile and the stop is hit too quickly. |
-| `refTokenStr` mismatch after breakout | `refTokenStr` was quoted at startup. After a big price move, the actual tokens received from the buy will differ. The trailing stop tracks `refTokenStr → ETH`, not the literal wallet balance. | The trail is an indicator. Actual sell executes `refTokenStr` as the sell amount, which was the expected quantity at startup. May leave a tiny amount unsold if actual received was higher. |
+| `refTokenStr` mismatch after breakout | `refTokenStr` was quoted at startup. After a big price move, the actual tokens received from the buy will differ. The trailing stop tracks `refTokenStr → BaseToken`, not the literal wallet balance. | The trail is an indicator. Actual sell executes `refTokenStr` as the sell amount, which was the expected quantity at startup. May leave a tiny amount unsold if actual received was higher. |
 | Dry-run shows repeated breakouts | In dry-run, no buy is executed, so the window continues updating. If price stays at the breakout level, multiple breakout signals will print each poll. | Expected behaviour. Dry-run is for observation only. |

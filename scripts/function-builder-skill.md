@@ -1,7 +1,14 @@
-# Speed CLI — Function Builder Skill
+# Speed CLI — Function Builder Skill (v2 style)
 
-Complete reference for building `.ps1` or `.sh` automation scripts using the `speed` CLI.
+Complete reference for building `.ps1` or `.sh` automation scripts using the `speed` CLI with v2-style base-token-aware patterns.
 Every command, flag, output format, token alias, chain alias, and scripting pattern is documented here.
+
+**Design rule:** Wrappers you generate should accept **any base token** and **any target token** (addresses or aliases). Pass both through to `speed quote` / `speed swap` as `--sell` and `--buy`. Do not hardcode a pair in shared helpers.
+
+- **Base token** (spend / receive / P/L denomination): default **`speed`** — matches v2 scripts’ `-BaseToken` default.
+- **Target token** (the asset you buy, sell, or track): **required per flow** — any `0x…` or alias (`eth`, `speed`, …).
+
+The CLI still has its **own** defaults when flags are omitted (e.g. `swap` may default sell to native `eth` and buy to `speed`). In scripts, **always pass `--sell` and `--buy` explicitly** when building generic tools so behavior does not depend on CLI defaults.
 
 ---
 
@@ -51,7 +58,8 @@ These flags apply to **every** command and are placed **before** the subcommand 
 | `--yes` | `-y` | Skip confirmation prompts (required for non-interactive scripts). |
 
 ```
-speed --json --yes swap -c base -a 0.001
+# Generic helpers: always pass --sell and --buy. (Shortcut below uses CLI defaults only.)
+speed --json --yes swap -c base --sell eth --buy speed -a 0.001
 speed --json balance -c base
 ```
 
@@ -100,10 +108,25 @@ These shorthands are accepted by `--sell`, `--buy`, `--token` on all commands:
 | Any `0x...` address | Used as-is |
 
 **Defaults when omitted:**
-- `swap`: sell = ETH, buy = SPEED
+- `swap`: sell = native token alias (`eth`), buy = SPEED
 - `dca`: token = SPEED
 - `volume`: token = SPEED
 - `gas`: token = wrapped native (WETH/WBNB/WPOL)
+
+### Parameterize base and target in functions
+
+| Role | Typical name | Default in v2-style bots | CLI flags |
+|---|---|---|---|
+| Base (quote / spend / receive) | `$BaseToken`, `BASE_TOKEN` | `speed` | `--sell` when buying target; `--buy` when selling target |
+| Target (asset traded) | `$TargetToken`, `TOKEN` | *(none — pass in)* | `--buy` when buying; `--sell` when selling |
+
+**Buy target with base:** `speed quote -c $Chain --sell $BaseToken --buy $TargetToken -a $baseSpend`
+
+**Quote base return for a target position:** `speed quote -c $Chain --sell $TargetToken --buy $BaseToken -a $humanTargetAmt`
+
+**Exit target → base:** `speed swap -c $Chain --sell $TargetToken --buy $BaseToken -a $humanTargetAmt -y`
+
+Higher-level scripts may implement a **same-token guard** (if base alias equals target alias, fall back to `eth` for one leg) so you never request a noop pair — mirror the v2 `*-any` PS1/sh wrappers when needed.
 
 ---
 
@@ -196,18 +219,18 @@ Note: `speedPerNative` is SPEED per 1 ETH (raw float). `speedUsd` and `nativeUsd
 Preview a swap without executing. Returns amounts only — no transaction.
 
 ```
+speed quote -c base --sell speed --buy 0xcbB7... -a 1000
+speed quote -c base --sell 0xcbB7... --buy speed -a 0.00000333
 speed quote -c base --sell eth --buy speed -a 0.001
-speed quote -c base --sell speed --buy eth -a 9000
-speed quote -c base --sell eth --buy 0xTokenAddr -a 0.002
-speed --json quote -c base --sell eth --buy speed -a 0.001
+speed --json quote -c base --sell speed --buy 0xcbB7... -a 1000
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `-c, --chain` | `8453` | Chain. |
-| `--sell <address\|alias>` | ETH | Token to sell. |
+| `--sell <address\|alias>` | native (`eth`) | Token to sell. |
 | `--buy <address\|alias>` | SPEED | Token to buy. |
-| `-a, --amount <amount>` | required | Sell amount in human units (e.g. `0.001` ETH or `9000` SPEED). |
+| `-a, --amount <amount>` | required | Sell amount in human units (e.g. `1000` SPEED or `0.001` ETH). |
 
 **JSON output:**
 ```json
@@ -233,26 +256,26 @@ speed --json quote -c base --sell eth --buy speed -a 0.001
 One-shot: quote → (optional confirm) → approve if needed → execute.
 
 ```
-# ETH → SPEED (defaults)
-speed swap -c base -a 0.001 -y
+# SPEED → cbBTC (v2-style spend in speed)
+speed swap -c base --sell speed --buy 0xcbB7... -a 1000 -y
 
-# SPEED → ETH
-speed swap -c base --sell speed --buy eth -a 9000 -y
+# cbBTC → SPEED
+speed swap -c base --sell 0xcbB7... --buy speed -a 0.00000333 -y
 
-# ETH → any token
-speed swap -c base --sell eth --buy 0xTokenAddr -a 0.002 -y
+# Native ETH → SPEED
+speed swap -c base --sell eth --buy speed -a 0.001 -y
 
 # Dry run (no tx)
-speed swap -c base -a 0.001 --dry-run
+speed swap -c base --sell speed --buy 0xcbB7... -a 1000 --dry-run
 
 # JSON output for scripts
-speed --json --yes swap -c base -a 0.001
+speed --json --yes swap -c base --sell speed --buy 0xcbB7... -a 1000
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `-c, --chain` | `8453` | Chain. |
-| `--sell <address\|alias>` | ETH | Sell token. |
+| `--sell <address\|alias>` | native (`eth`) | Sell token. |
 | `--buy <address\|alias>` | SPEED | Buy token. |
 | `-a, --amount <amount>` | required | Sell amount in human units. |
 | `-y, --yes` / `--go` | false | Skip confirmation prompt. **Required in scripts.** |
@@ -276,7 +299,7 @@ speed --json --yes swap -c base -a 0.001
 **Error exit codes:** Non-zero on any failure. Error JSON: `{ "error": "...", "code": "SWAP_ERROR" }`.
 
 **Important limits:**
-- Minimum swap: ~0.0001 ETH (dust protection from 0x).
+- Minimum swap: ~0.0001 ETH-equivalent (dust protection from 0x).
 - When selling native ETH, leave gas headroom (e.g. `-a 0.0015` not `-a 0.002` if balance is 0.002).
 
 ---
@@ -428,7 +451,7 @@ speed --json estimate -c base --sell eth --buy speed -a 0.001
 
 ### dca
 
-Dollar-cost average: buy a token with ETH on a fixed interval. Runs until stopped or `--count` buys complete.
+Dollar-cost average: buy a token with a chosen sell asset (`--sell`, default native `eth`) on a fixed interval. Runs until stopped or `--count` buys complete.
 
 ```
 # Buy SPEED every 5 minutes until stopped
@@ -450,7 +473,7 @@ speed --json --yes dca -c base -a 0.001 --interval 5m --count 10
 |---|---|---|
 | `-c, --chain` | `8453` | Chain. |
 | `-t, --token <address\|speed>` | SPEED | Token to buy. |
-| `-a, --amount <amount>` | required | ETH per buy in human units. Min `0.0001` ETH. |
+| `-a, --amount <amount>` | required | Sell-token amount per buy in human units. Min ~`0.0001` ETH-equivalent. |
 | `--interval <s\|5m\|1h\|1d>` | `300` | Time between buys. Accepts seconds or `Nm`, `Nh`, `Nd`. |
 | `--interval-jitter <fraction>` | `0` | Random ± variance on interval (e.g. `0.2` = ±20%). |
 | `--count <n>` | unlimited | Number of buys to execute then exit. |
@@ -475,7 +498,7 @@ speed --json --yes dca -c base -a 0.001 --interval 5m --count 10
 Human-like interleaved buys and sells with random walk amounts and jitter delays. Useful for generating organic-looking on-chain activity.
 
 ```
-# 20 ops, initial 0.001 ETH per buy
+# 20 ops, initial 0.001 native ETH per buy
 speed volume -c base -a 0.001 --ops 20 -y
 
 # Custom bounds and sell frequency
@@ -492,9 +515,9 @@ speed --json --yes volume -c base -a 0.001 --ops 20
 | `-c, --chain` | `8453` | Chain. |
 | `-t, --token <address\|speed>` | SPEED | Token to buy/sell. |
 | `--ops <n>` | `20` | Total number of operations (buys + sells). |
-| `-a, --amount <amount>` | required | Initial ETH per buy. |
-| `--amount-min <amount>` | 50% of initial | Minimum ETH per buy. |
-| `--amount-max <amount>` | 150% of initial | Maximum ETH per buy. |
+| `-a, --amount <amount>` | required | Initial sell-token amount per buy. |
+| `--amount-min <amount>` | 50% of initial | Minimum sell-token amount per buy. |
+| `--amount-max <amount>` | 150% of initial | Maximum sell-token amount per buy. |
 | `--amount-drift <fraction>` | `0.1` | Max relative random walk step per op (e.g. `0.1` = ±10%). |
 | `--sell-frequency <0..1>` | `0.2` | Probability any given op is a sell (0 = never sell, 1 = always sell). |
 | `--sell-partial-chance <0..1>` | `0.3` | When selling, probability of partial (random fraction) vs full balance. |
@@ -698,14 +721,16 @@ Always pass `--json` (before the subcommand) when scripting. The CLI writes a si
 ### PowerShell
 
 ```powershell
-# Capture JSON and parse
-$raw  = speed --json quote -c base --sell eth --buy speed -a 0.001 2>&1
+# Capture JSON and parse (use variables for any base / target; default base = speed)
+$BaseToken   = 'speed'
+$TargetToken = '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf'
+$raw  = speed --json quote -c base --sell $BaseToken --buy $TargetToken -a 1000 2>&1
 $line = $raw | Where-Object { $_ -match '^\{' } | Select-Object -First 1
 $obj  = $line | ConvertFrom-Json
 $buyAmount = [double]$obj.buyAmount
 
-# Swap and parse tx hash
-$raw2   = speed --json --yes swap -c base -a 0.001 2>&1
+# Swap and parse tx hash (explicit legs — do not rely on CLI defaults in generic scripts)
+$raw2   = speed --json --yes swap -c base --sell $BaseToken --buy $TargetToken -a 1000 2>&1
 $line2  = $raw2 | Where-Object { $_ -match '^\{' } | Select-Object -First 1
 $result = $line2 | ConvertFrom-Json
 Write-Host $result.txHash
@@ -715,7 +740,9 @@ Write-Host $result.txHash
 
 ```bash
 # Capture JSON and extract field (no jq needed)
-raw=$(speed --json quote -c base --sell eth --buy speed -a 0.001 2>&1)
+BASE_TOKEN=speed
+TARGET_TOKEN=0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf
+raw=$(speed --json quote -c base --sell "$BASE_TOKEN" --buy "$TARGET_TOKEN" -a 1000 2>&1)
 json=$(echo "$raw" | grep -m1 '^{')
 buy_amount=$(echo "$json" | grep -oP '"buyAmount"\s*:\s*"\K[^"]+')
 
@@ -723,7 +750,7 @@ buy_amount=$(echo "$json" | grep -oP '"buyAmount"\s*:\s*"\K[^"]+')
 buy_amount=$(echo "$json" | jq -r '.buyAmount')
 
 # Swap and get tx hash
-raw2=$(speed --json --yes swap -c base -a 0.001 2>&1)
+raw2=$(speed --json --yes swap -c base --sell "$BASE_TOKEN" --buy "$TARGET_TOKEN" -a 1000 2>&1)
 json2=$(echo "$raw2" | grep -m1 '^{')
 tx_hash=$(echo "$json2" | grep -oP '"txHash"\s*:\s*"\K[^"]+')
 ```
@@ -732,7 +759,7 @@ tx_hash=$(echo "$json2" | grep -oP '"txHash"\s*:\s*"\K[^"]+')
 
 Errors also come as JSON when `--json` is set:
 ```json
-{ "error": "Insufficient ETH...", "code": "INSUFFICIENT_FUNDS" }
+{ "error": "Insufficient funds for sell token...", "code": "INSUFFICIENT_FUNDS" }
 ```
 
 Check for the `error` field before reading success fields:
@@ -879,6 +906,7 @@ get_token_decimals() {
 # CORRECT: use named parameters, not splatted arrays named $Args
 function Get-Quote {
     param([string]$sellTok, [string]$buyTok, [string]$sellAmt)
+    # sellTok / buyTok = any token addresses or aliases (base vs target depends on direction of the quote)
     $raw  = speed quote --json -c $Chain --sell $sellTok --buy $buyTok -a $sellAmt 2>&1
     $line = $raw | Where-Object { $_ -match '^\{' } | Select-Object -First 1
     if (-not $line) { throw "No JSON from quote. Output: $($raw -join "`n")" }
@@ -892,7 +920,8 @@ function Get-Quote {
 
 ```powershell
 # Always use F + token decimal count. Never use G10 or F6 for small amounts.
-$decimals   = Get-TokenDecimals $Token $Chain
+# $TokenAddr = whichever token's raw amount you are formatting (target or base)
+$decimals   = Get-TokenDecimals $TokenAddr $Chain
 $scale      = [Math]::Pow(10, $decimals)
 $humanAmt   = [double]$rawAmount / $scale
 $amountStr  = $humanAmt.ToString("F$decimals")   # e.g. "0.00002915" for cbBTC
@@ -921,7 +950,8 @@ while ($iteration -lt $MaxIterations) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $q = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+        # Position marked in base: quote TargetToken -> BaseToken (defaults: BaseToken = 'speed')
+        $q = Get-Quote -sellTok $TargetToken -buyTok $BaseToken -sellAmt $tokenStr
         $current = [double]$q.buyAmount
         # ... compare and act
     } catch {
@@ -984,7 +1014,7 @@ while (( iteration < MAX_ITERATIONS )); do
     echo "[$ts] Poll $iteration / $MAX_ITERATIONS - waiting $POLL_SECONDS s..."
     sleep "$POLL_SECONDS"
 
-    poll_json=$(get_quote "$TOKEN" "eth" "$token_str" 2>&1) || {
+    poll_json=$(get_quote "$TARGET_TOKEN" "$BASE_TOKEN" "$token_str" 2>&1) || {
         echo "Warning: poll $iteration failed - retrying."
         continue
     }
@@ -1008,9 +1038,11 @@ done
 | Scientific notation (`2.9E-05`) breaks CLI amount parsing | Use `"F{decimals}"` format, not `"G10"` or `"F6"`. |
 | Zero amount after decimal conversion | Token has fewer than 18 decimals. Auto-detect with `Get-TokenDecimals`. |
 | `--buy` and `--amount` required error in `quote` | Caused by `@Args` splatting a PowerShell automatic variable. Pass args as named string params. |
-| Swap reverts with "slippage / minimum amount" | Amount is too small (< ~0.0001 ETH equivalent). Use larger amounts. |
+| Swap reverts with "slippage / minimum amount" | Amount is too small (< ~0.0001 ETH-equivalent). Use larger amounts. |
 | `buyAmount` missing from quote JSON | Quote returned an error object. Check for `"error"` field first. |
-| Insufficient ETH for swap | When selling native ETH, reserve gas headroom. Use 90% of balance or smaller amount. |
+| Insufficient native gas | Gas is still paid in the chain native token (e.g. ETH on Base). When selling native `eth`, reserve headroom. |
+| Hardcoded `'eth'` as the quote leg | Use `$BaseToken` / `BASE_TOKEN` (default `speed` for v2 bots). Only use `eth` when you intentionally mean native ETH. |
+| Base token equals target token | Some v2 scripts switch one leg to `eth` to avoid a noop pair — implement the same guard if you expose arbitrary tokens. |
 | `history` / `pending` returns empty | `ALCHEMY_API_KEY` not set. Both commands require Alchemy. |
 | `bridge` / `status --request-id` fails | `SQUID_INTEGRATOR_ID` not set in environment. |
 | Token decimals wrong for WBTC/cbBTC/USDC | Call `decimals()` via RPC (selector `0x313ce567`) or hardcode: WBTC/cbBTC=8, USDC/USDT=6. |

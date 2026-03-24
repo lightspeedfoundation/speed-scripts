@@ -1,17 +1,17 @@
 <#
 .SYNOPSIS
     Value averaging: on each interval, buy the deficit (or sell the surplus)
-    needed to keep a portfolio value trajectory growing by -TargetIncrement ETH
+    needed to keep a portfolio value trajectory growing by -TargetIncrement (in -BaseToken)
     per interval. Buys more when price is low, less when high.
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
     2. Starts with zero accumulated tokens and a zero target value.
     3. Each interval:
-       a. Raises the target value by -TargetIncrement ETH.
+       a. Raises the target value by -TargetIncrement (BaseToken units).
        b. Quotes the current accumulated position value.
        c. Computes deficit (target - current) or surplus (current - target).
-       d. If deficit > 0: buys min(deficit, MaxBuyPerInterval) ETH of tokens.
+       d. If deficit > 0: buys min(deficit, MaxBuyPerInterval) BaseToken of tokens.
        e. If surplus > 0 and -AllowSell: sells proportional token fraction.
        f. Prints: interval, target, current value, action, average entry cost.
     4. Runs -Intervals times then prints a final summary.
@@ -22,10 +22,10 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    Value targets are in -BaseToken (default: speed).
 
 .PARAMETER TargetIncrement
-    ETH growth target per interval (e.g. 0.001 = grow position by 0.001 ETH
+    BaseToken growth target per interval (e.g. 0.001 = grow position value by 0.001 base
     per interval). This is the "pace" of accumulation.
 
 .PARAMETER Intervals
@@ -35,7 +35,7 @@
     Seconds between intervals. Default: 3600 (1 hour).
 
 .PARAMETER MaxBuyPerInterval
-    Maximum ETH to spend in any single interval. Caps runaway buys when
+    Maximum BaseToken to spend in any single interval. Caps runaway buys when
     position is far below target. Default: TargetIncrement * 3.
 
 .PARAMETER AllowSell
@@ -45,6 +45,10 @@
 
 .PARAMETER DryRun
     Print plan and projected actions without executing any swaps.
+
+.PARAMETER DustThreshold
+    Minimum base-token buy size per interval; skips smaller buys. Default 0.0001 in base
+    units — override for low-decimal bases (e.g. USDC: -DustThreshold 0.5).
 
 .EXAMPLE
     .\value-average-any.ps1 -Chain base -Token speed -TargetIncrement 0.001 -Intervals 24 -IntervalSeconds 3600
@@ -62,13 +66,16 @@ param(
     [int]                          $IntervalSeconds    = 3600,
     [double]                       $MaxBuyPerInterval  = -1,   # -1 = auto (TargetIncrement * 3)
     [switch]                       $AllowSell,
-    [switch]                       $DryRun
+    [switch]                       $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = '',
+    [double]                       $DustThreshold   = 0.0001
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -135,6 +142,12 @@ $tokenDecimals = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
 $TOKEN_SCALE   = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel    = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
 if ($TargetIncrement -le 0) { Write-Error "-TargetIncrement must be > 0."; exit 1 }
 if ($Intervals -lt 1)       { Write-Error "-Intervals must be >= 1."; exit 1 }
 
@@ -148,18 +161,19 @@ Write-Host "=== Speed Value Averaging ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- no swaps will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain              : $Chain"
 Write-Host "  Token              : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host ("  Target increment   : {0:F8} ETH per interval" -f $TargetIncrement)
-Write-Host ("  Max buy/interval   : {0:F8} ETH" -f $MaxBuyPerInterval)
+Write-Host ("  Target increment   : {0:F8} {1} per interval" -f $TargetIncrement, $script:BaseLabel)
+Write-Host ("  Max buy/interval   : {0:F8} {1}" -f $MaxBuyPerInterval, $script:BaseLabel)
 Write-Host "  Intervals          : $Intervals"
 Write-Host "  Interval length    : $IntervalSeconds s"
-Write-Host ("  Final target value : {0:F8} ETH  (after all intervals)" -f $totalTargetETH)
+Write-Host ("  Final target value : {0:F8} {1}  (after all intervals)" -f $totalTargetETH, $script:BaseLabel)
+Write-Host ("  Dust threshold     : {0:F8} {1}  (min buy; raise for 6-dec stablecoins, etc.)" -f $DustThreshold, $script:BaseLabel)
 Write-Host "  Allow sell         : $($AllowSell.IsPresent)"
 Write-Host ""
 
 # ── state ─────────────────────────────────────────────────────────────────────
 
 $accTokenHuman    = 0.0    # accumulated token balance (human units)
-$targetValueETH   = 0.0    # current target portfolio value in ETH
+$targetValueETH   = 0.0    # current target portfolio value in base token
 $totalEthSpent    = 0.0
 $totalEthReceived = 0.0
 $totalBuys        = 0
@@ -191,9 +205,9 @@ for ($interval = 1; $interval -le $Intervals; $interval++) {
     if ($accTokenHuman -gt 0) {
         try {
             $accStr    = $accTokenHuman.ToString("F$tokenDecimals")
-            $valQuote  = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $accStr
+            $valQuote  = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $accStr
             $currentValueRaw = [double]$valQuote.buyAmount
-            $currentValueETH = $currentValueRaw / $ETH_DECIMALS
+            $currentValueETH = $currentValueRaw / $script:BASE_DECIMALS_SCALE
         } catch {
             Write-Warning "Could not get position value on interval $interval : $_ -- using 0."
             $currentValueETH = 0.0
@@ -209,58 +223,53 @@ for ($interval = 1; $interval -le $Intervals; $interval++) {
 
     Write-Host ""
     Write-Host ("=== Interval {0}/{1}  [{2}] ===" -f $interval, $Intervals, $ts2) -ForegroundColor Yellow
-    Write-Host ("  Target value    : {0:F8} ETH" -f $targetValueETH)
-    Write-Host ("  Current value   : {0:F8} ETH  ({1:F4} {2} held)" -f $currentValueETH, $accTokenHuman, $TokenLabel)
-    Write-Host ("  Deficit/Surplus : {0:+0.00000000} ETH" -f $deficitETH)
-    Write-Host ("  Avg entry cost  : {0} ETH per {1}" -f $avgCostStr, $TokenLabel)
+    Write-Host ("  Target value    : {0:F8} {1}" -f $targetValueETH, $script:BaseLabel)
+    Write-Host ("  Current value   : {0:F8} {3}  ({1} {2} held)" -f $currentValueETH, $accTokenHuman.ToString("F$tokenDecimals"), $TokenLabel, $script:BaseLabel)
+    $deficitDisp = if ($deficitETH -ge 0) { '+' + $deficitETH.ToString('F8') } else { $deficitETH.ToString('F8') }
+    Write-Host ("  Deficit/Surplus : {0} {1}" -f $deficitDisp, $script:BaseLabel)
+    Write-Host ("  Avg entry cost  : {0} {2} per {1}" -f $avgCostStr, $TokenLabel, $script:BaseLabel)
 
     # d) Buy if below target
     if ($deficitETH -gt 0) {
         $buyETH = [Math]::Min($deficitETH, $MaxBuyPerInterval)
 
-        if ($buyETH -lt 0.0001) {
-            Write-Host ("  Action          : SKIP (buy amount {0:F8} ETH below 0.0001 ETH dust limit)" -f $buyETH) -ForegroundColor DarkGray
+        if ($buyETH -lt $DustThreshold) {
+            Write-Host ("  Action          : SKIP (buy amount {0:F8} {1} below dust threshold {2:F8} {1})" -f $buyETH, $script:BaseLabel, $DustThreshold) -ForegroundColor DarkGray
             $skippedDust++
         } else {
-            Write-Host ("  Action          : BUY {0:F8} ETH of {1}" -f $buyETH, $TokenLabel) -ForegroundColor Cyan
+            Write-Host ("  Action          : BUY {0:F8} {2} of {1}" -f $buyETH, $TokenLabel, $script:BaseLabel) -ForegroundColor Cyan
             $buyEthStr = $buyETH.ToString("F8")
 
             if ($DryRun) {
                 # Estimate token amount for running tallies
                 try {
-                    $dryQ       = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $buyEthStr
+                    $dryQ       = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $buyEthStr
                     $dryTokRaw  = [double]$dryQ.buyAmount
                     $dryTokHuman= $dryTokRaw / $TOKEN_SCALE
                     $accTokenHuman   += $dryTokHuman
                     $totalEthSpent   += $buyETH
                     $totalBuys++
-                    Write-Host ("  [DRY-RUN] Would buy {0} {1} for {2:F8} ETH" -f `
-                        $dryTokHuman.ToString("F$tokenDecimals"), $TokenLabel, $buyETH) -ForegroundColor DarkYellow
+                    Write-Host ("  [DRY-RUN] Would buy {0} {1} for {2:F8} {3}" -f `
+                        $dryTokHuman.ToString("F$tokenDecimals"), $TokenLabel, $buyETH, $script:BaseLabel) -ForegroundColor DarkYellow
                 } catch {
                     Write-Warning "Dry-run quote failed: $_"
                 }
             } else {
                 try {
-                    # Quote first to know expected token amount
-                    $preQ       = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $buyEthStr
-                    $preTokRaw  = [double]$preQ.buyAmount
-                    $preTokHuman= $preTokRaw / $TOKEN_SCALE
-                    $preTokStr  = $preTokHuman.ToString("F$tokenDecimals")
-
-                    Write-Host ("  >>> speed swap -c {0} --sell eth --buy {1} -a {2} -y" -f `
+                    Write-Host ("  >>> speed --json --yes swap -c {0} --sell $BaseToken --buy {1} -a {2} -y" -f `
                         $Chain, $Token, $buyEthStr) -ForegroundColor Cyan
 
-                    $swapOut  = speed --json --yes swap -c $Chain --sell eth --buy $Token -a $buyEthStr 2>&1
-                    $swapLine = $swapOut | Where-Object { $_ -match '^\{' } | Select-Object -First 1
-                    $swapRes  = $swapLine | ConvertFrom-Json
+                    $preBuyQ   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $buyEthStr
+                    $preTokRaw = [double]$preBuyQ.buyAmount
 
-                    if ($swapRes.PSObject.Properties.Name -contains 'error') {
-                        throw "Swap error: $($swapRes.error)"
-                    }
+                    $swapOut = speed --json --yes swap -c $Chain --sell $BaseToken --buy $Token -a $buyEthStr -y 2>&1
+                    if ($LASTEXITCODE -ne 0) { throw "Buy swap failed (exit $LASTEXITCODE)." }
 
-                    Write-Host ("  TX: {0}" -f $swapRes.txHash) -ForegroundColor DarkGray
-
-                    $accTokenHuman   += $preTokHuman
+                    $swapObj  = Get-SwapJsonFromSpeedOutput -out $swapOut
+                    $gotTokRaw = Resolve-SpeedSwapBuyAmountRaw -SwapJson $swapObj -QuoteBuyRawFallback $preTokRaw
+                    if ($null -eq $gotTokRaw) { throw "Could not resolve buy amount from swap JSON." }
+                    $gotTokHuman = $gotTokRaw / $TOKEN_SCALE
+                    $accTokenHuman += $gotTokHuman
                     $totalEthSpent   += $buyETH
                     $totalBuys++
                 } catch {
@@ -284,15 +293,15 @@ for ($interval = 1; $interval -le $Intervals; $interval++) {
             if ([double]$sellStr -lt [Math]::Pow(10, -$tokenDecimals)) {
                 Write-Host "  Action          : SKIP SELL (amount too small)" -ForegroundColor DarkGray
             } else {
-                Write-Host ("  Action          : SELL {0} {1}  (surplus: {2:F8} ETH, {3:F4}% of position)" -f `
-                    $sellStr, $TokenLabel, $surplusETH, $sellRatio * 100.0) -ForegroundColor Magenta
+                Write-Host ("  Action          : SELL {0} {1}  (surplus: {2:F8} {4}, {3:F4}% of position)" -f `
+                    $sellStr, $TokenLabel, $surplusETH, $sellRatio * 100.0, $script:BaseLabel) -ForegroundColor Magenta
 
                 if ($DryRun) {
                     try {
-                        $dryQ2   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $sellStr
-                        $dryEth2 = [double]$dryQ2.buyAmount / $ETH_DECIMALS
-                        Write-Host ("  [DRY-RUN] Would sell {0} {1} for approx {2:F8} ETH" -f `
-                            $sellStr, $TokenLabel, $dryEth2) -ForegroundColor DarkYellow
+                        $dryQ2   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $sellStr
+                        $dryEth2 = [double]$dryQ2.buyAmount / $script:BASE_DECIMALS_SCALE
+                        Write-Host ("  [DRY-RUN] Would sell {0} {1} for approx {2:F8} {3}" -f `
+                            $sellStr, $TokenLabel, $dryEth2, $script:BaseLabel) -ForegroundColor DarkYellow
                         $accTokenHuman   -= $sellHuman
                         $totalEthReceived+= $dryEth2
                         $totalSells++
@@ -301,25 +310,21 @@ for ($interval = 1; $interval -le $Intervals; $interval++) {
                     }
                 } else {
                     try {
-                        Write-Host ("  >>> speed swap -c {0} --sell {1} --buy eth -a {2} -y" -f `
+                        Write-Host ("  >>> speed --json --yes swap -c {0} --sell {1} --buy $BaseToken -a {2} -y" -f `
                             $Chain, $Token, $sellStr) -ForegroundColor Cyan
 
-                        $sellOut  = speed --json --yes swap -c $Chain --sell $Token --buy eth -a $sellStr 2>&1
-                        $sellLine = $sellOut | Where-Object { $_ -match '^\{' } | Select-Object -First 1
-                        $sellRes  = $sellLine | ConvertFrom-Json
+                        $preSellQ   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $sellStr
+                        $preBaseRaw = [double]$preSellQ.buyAmount
 
-                        if ($sellRes.PSObject.Properties.Name -contains 'error') {
-                            throw "Swap error: $($sellRes.error)"
-                        }
+                        $swapOut = speed --json --yes swap -c $Chain --sell $Token --buy $BaseToken -a $sellStr -y 2>&1
+                        if ($LASTEXITCODE -ne 0) { throw "Sell swap failed (exit $LASTEXITCODE)." }
 
-                        Write-Host ("  TX: {0}" -f $sellRes.txHash) -ForegroundColor DarkGray
-
-                        # Estimate ETH received for P&L tracking
-                        try {
-                            $checkQ   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $sellStr
-                            $ethRec   = [double]$checkQ.buyAmount / $ETH_DECIMALS
+                        $swapObj    = Get-SwapJsonFromSpeedOutput -out $swapOut
+                        $gotBaseRaw = Resolve-SpeedSwapBuyAmountRaw -SwapJson $swapObj -QuoteBuyRawFallback $preBaseRaw
+                        if ($null -ne $gotBaseRaw) {
+                            $ethRec = $gotBaseRaw / $script:BASE_DECIMALS_SCALE
                             $totalEthReceived += $ethRec
-                        } catch { }
+                        }
 
                         $accTokenHuman -= $sellHuman
                         $totalSells++
@@ -342,18 +347,18 @@ Write-Host ("  Intervals run      : {0}" -f $Intervals)
 Write-Host ("  Total buys         : {0}" -f $totalBuys)
 Write-Host ("  Total sells        : {0}" -f $totalSells)
 Write-Host ("  Dust skips         : {0}" -f $skippedDust)
-Write-Host ("  ETH spent          : {0:F8} ETH" -f $totalEthSpent)
-Write-Host ("  ETH received       : {0:F8} ETH" -f $totalEthReceived)
+Write-Host ("  Base spent         : {0:F8} {1}" -f $totalEthSpent, $script:BaseLabel)
+Write-Host ("  Base received      : {0:F8} {1}" -f $totalEthReceived, $script:BaseLabel)
 
 $netDeployed = $totalEthSpent - $totalEthReceived
-Write-Host ("  Net ETH deployed   : {0:F8} ETH" -f $netDeployed)
+Write-Host ("  Net base deployed  : {0:F8} {1}" -f $netDeployed, $script:BaseLabel)
 
 if ($accTokenHuman -gt 0) {
     $accStr = $accTokenHuman.ToString("F$tokenDecimals")
     Write-Host ("  Final position     : {0} {1}" -f $accStr, $TokenLabel)
     if ($totalEthSpent -gt 0 -and $accTokenHuman -gt 0) {
         $avgCost = $totalEthSpent / $accTokenHuman
-        Write-Host ("  Avg entry cost     : {0:F8} ETH per {1}" -f $avgCost, $TokenLabel)
+        Write-Host ("  Avg entry cost     : {0:F8} {2} per {1}" -f $avgCost, $TokenLabel, $script:BaseLabel)
     }
     Write-Host ""
     Write-Host "  Position remains open. Use trailing-stop-any.ps1 or limit-order-any.ps1 to exit." -ForegroundColor DarkGray

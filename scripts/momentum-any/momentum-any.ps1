@@ -2,30 +2,30 @@
 .SYNOPSIS
     Momentum buy: track a rolling price window and only buy when price breaks
     above the window high by -BreakoutPct%. Once in, a trailing stop manages
-    the exit. Never spends ETH unless a confirmed breakout occurs.
+    the exit. Never spends base unless a confirmed breakout occurs.
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes -Amount ETH -> <Token> to derive a reference amount for price
+    2. Quotes -Amount of -BaseToken -> <Token> to derive a reference amount for price
        tracking (does NOT execute a buy yet).
-    3. Quotes that reference amount -> ETH to establish an initial price.
+    3. Quotes that reference amount -> BaseToken to establish an initial price.
     4. Warm-up phase: polls -WindowPolls times to build the initial rolling
        price window (no buys possible during warm-up).
     5. Monitoring phase: each subsequent poll updates the rolling window.
        Breakout condition: currentPrice >= windowHigh * (1 + BreakoutPct/100)
-    6. On breakout: executes the buy (-Amount ETH -> Token).
+    6. On breakout: executes the buy (-Amount BaseToken -> Token).
     7. Post-buy: runs a trailing stop. Peak rises on new highs; sells when
-       ETH return drops -TrailPct% below the running peak.
+       base return drops -TrailPct% below the running peak.
     8. If -MaxIterations polls pass without a breakout: exits without buying.
 
     Use -DryRun to observe the window and breakout detection without buying.
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH / native is always the quote currency.
+    Amounts and P/L are in -BaseToken (default: speed).
 
 .PARAMETER Amount
-    ETH to spend when a breakout is confirmed.
+    Amount of -BaseToken to spend when a breakout is confirmed.
 
 .PARAMETER WindowPolls
     Number of recent polls used to determine the rolling price high.
@@ -42,13 +42,13 @@
 
 .PARAMETER VolumeConfirm
     Switch. When set, runs a pool depth check before executing any breakout buy.
-    Compares price-per-unit at Amount vs Amount*VolumeMultiple ETH. If the implied
+    Compares price-per-unit at Amount vs Amount*VolumeMultiple in BaseToken. If the implied
     price impact exceeds MaxImpactPct%, the entry is skipped (not the script).
     Subsequent breakout signals are still evaluated. Breakouts on thin pools are rejected.
 
 .PARAMETER VolumeMultiple
     Multiplier for the large quote in the volume check. Default: 10.
-    A quote for Amount*10 ETH vs Amount ETH reveals pool depth.
+    A large vs small quote in BaseToken reveals pool depth.
 
 .PARAMETER MaxImpactPct
     Maximum acceptable price impact % for the volume check. Default: 5.
@@ -71,20 +71,22 @@ param(
     [Parameter(Mandatory)][string] $Amount,
     [string]                       $TokenSymbol   = "",
     [int]                          $WindowPolls   = 20,
-    [double]                       $BreakoutPct   = 0.0,
+    [double]                       $BreakoutPct   = 0.5,
     [double]                       $TrailPct      = 5.0,
     [int]                          $PollSeconds     = 60,
     [int]                          $MaxIterations   = 1440,
     [switch]                       $VolumeConfirm,
     [double]                       $VolumeMultiple  = 10.0,
     [double]                       $MaxImpactPct    = 5.0,
-    [switch]                       $DryRun
+    [switch]                       $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -146,8 +148,8 @@ function Get-Quote {
 function Run-Sell {
     param([string]$tokenAmount)
     Write-Host ""
-    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y" -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
     exit $LASTEXITCODE
 }
 
@@ -159,15 +161,23 @@ $tokenDecimals = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
 $TOKEN_SCALE   = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel    = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
 if ($WindowPolls -lt 2) { Write-Error "-WindowPolls must be >= 2."; exit 1 }
 if ($TrailPct -le 0)    { Write-Error "-TrailPct must be > 0."; exit 1 }
+if ($BreakoutPct -lt 0) { Write-Error "-BreakoutPct must be >= 0."; exit 1 }
+if ($BreakoutPct -eq 0) { Write-Warning "-BreakoutPct 0: any price at or above window high triggers entry immediately after warm-up." }
 
 Write-Host ""
 Write-Host "=== Speed Momentum Buy ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- breakout signals logged, no buy will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain          : $Chain"
 Write-Host "  Token          : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  Buy amount     : $Amount ETH  (on breakout)"
+Write-Host "  Buy amount     : $Amount $($script:BaseLabel)  (on breakout)"
 Write-Host "  Window polls   : $WindowPolls  (warm-up + rolling high)"
 Write-Host "  Breakout pct   : $BreakoutPct % above window high"
 Write-Host "  Trail pct      : $TrailPct % drop from peak triggers sell"
@@ -180,9 +190,9 @@ Write-Host ""
 
 # -- step 1: reference quote (no buy yet) -------------------------------------
 
-Write-Host "Step 1 - Quoting $Amount ETH -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $Amount $($script:BaseLabel) -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
 
-$refBuyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
+$refBuyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
 $refTokenRaw   = [double]$refBuyQuote.buyAmount
 $refTokenHuman = $refTokenRaw / $TOKEN_SCALE
 $refTokenStr   = $refTokenHuman.ToString("F$tokenDecimals")
@@ -191,18 +201,18 @@ if ([double]$refTokenStr -le 0) {
     Write-Error "Reference token amount resolved to 0 (raw=$refTokenRaw, decimals=$tokenDecimals). Aborting."
     exit 1
 }
-Write-Host ("  Reference amount : {0} {1} for {2} ETH" -f $refTokenStr, $TokenLabel, $Amount)
+Write-Host ("  Reference amount : {0} {1} for {2} {3}" -f $refTokenStr, $TokenLabel, $Amount, $script:BaseLabel)
 
 # -- step 2: initial price observation ----------------------------------------
 
 Write-Host ""
 Write-Host "Step 2 - Getting initial price..." -ForegroundColor DarkCyan
 
-$initSellQuote = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+$initSellQuote = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
 $initRaw       = [double]$initSellQuote.buyAmount
-$initETH       = $initRaw / $ETH_DECIMALS
+$initETH       = $initRaw / $script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Initial price : {0:F8} ETH  (for {1} {2})" -f $initETH, $refTokenStr, $TokenLabel)
+Write-Host ("  Initial price : {0:F8} {3}  (for {1} {2})" -f $initETH, $refTokenStr, $TokenLabel, $script:BaseLabel)
 Write-Host ""
 
 # -- step 3: warm-up phase  - build initial window ------------------------------
@@ -223,15 +233,15 @@ while ($warmupDone -lt $warmupNeeded) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $wq       = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $wq       = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $wRaw     = [double]$wq.buyAmount
-        $wETH     = $wRaw / $ETH_DECIMALS
+        $wETH     = $wRaw / $script:BASE_DECIMALS_SCALE
         $wHigh    = ($window | Measure-Object -Maximum).Maximum
-        $wHighETH = $wHigh / $ETH_DECIMALS
+        $wHighETH = $wHigh / $script:BASE_DECIMALS_SCALE
         $wPct     = if ($wHigh -gt 0) { (($wRaw - $wHigh) / $wHigh) * 100.0 } else { 0.0 }
         $ts2      = Get-Date -Format "HH:mm:ss"
-        Write-Host ("[$ts2] Price: {0:F8} ETH  window high: {1:F8}  ({2:+0.00}% vs high)  [{3} samples]" -f `
-            $wETH, $wHighETH, $wPct, ($window.Count + 1)) -ForegroundColor DarkGray
+        Write-Host ("[$ts2] Price: {0:F8} {4}  window high: {1:F8} {4}  ({2:F4}% vs high)  [{3} samples]" -f `
+            $wETH, $wHighETH, $wPct, ($window.Count + 1), $script:BaseLabel) -ForegroundColor DarkGray
         $window.Enqueue($wRaw)
         if ($window.Count -gt $WindowPolls) { [void]$window.Dequeue() }
     } catch {
@@ -243,11 +253,11 @@ while ($warmupDone -lt $warmupNeeded) {
 
 Write-Host ""
 $windowHighRaw = ($window | Measure-Object -Maximum).Maximum
-$windowHighETH = $windowHighRaw / $ETH_DECIMALS
-Write-Host ("Warm-up complete. Window high: {0:F8} ETH  ({1} polls)" -f $windowHighETH, $WindowPolls) -ForegroundColor DarkCyan
+$windowHighETH = $windowHighRaw / $script:BASE_DECIMALS_SCALE
+Write-Host ("Warm-up complete. Window high: {0:F8} {2}  ({1} polls)" -f $windowHighETH, $WindowPolls, $script:BaseLabel) -ForegroundColor DarkCyan
 if ($BreakoutPct -gt 0) {
-    $breakoutThreshETH = ($windowHighRaw * (1.0 + $BreakoutPct / 100.0)) / $ETH_DECIMALS
-    Write-Host ("Breakout threshold: {0:F8} ETH  (window high + {1}%)" -f $breakoutThreshETH, $BreakoutPct) -ForegroundColor DarkCyan
+    $breakoutThreshETH = ($windowHighRaw * (1.0 + $BreakoutPct / 100.0)) / $script:BASE_DECIMALS_SCALE
+    Write-Host ("Breakout threshold: {0:F8} {2}  (window high + {1}%)" -f $breakoutThreshETH, $BreakoutPct, $script:BaseLabel) -ForegroundColor DarkCyan
 }
 Write-Host ""
 
@@ -261,6 +271,7 @@ $entryMade    = $false
 $tokenStr     = ""
 $peakRaw      = [double]0
 $floorRaw     = [double]0
+$dryRunBreakoutSeen = $false
 
 while ($iteration -lt $MaxIterations) {
     $iteration++
@@ -269,31 +280,31 @@ while ($iteration -lt $MaxIterations) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $currentETH = $currentRaw / $script:BASE_DECIMALS_SCALE
         $ts2        = Get-Date -Format "HH:mm:ss"
 
         # Update rolling window
         $window.Enqueue($currentRaw)
         if ($window.Count -gt $WindowPolls) { [void]$window.Dequeue() }
         $windowHighRaw = ($window | Measure-Object -Maximum).Maximum
-        $windowHighETH = $windowHighRaw / $ETH_DECIMALS
+        $windowHighETH = $windowHighRaw / $script:BASE_DECIMALS_SCALE
 
         # -- post-entry: trailing stop -----------------------------------------
         if ($entryMade) {
             # Re-quote actual bought token amount for accurate trail
-            $tq       = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+            $tq       = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
             $tRaw     = [double]$tq.buyAmount
-            $tETH     = $tRaw / $ETH_DECIMALS
+            $tETH     = $tRaw / $script:BASE_DECIMALS_SCALE
 
             if ($tRaw -gt $peakRaw) {
                 $peakRaw  = $tRaw
                 $floorRaw = $peakRaw * (1.0 - $TrailPct / 100.0)
             }
 
-            $peakETH      = $peakRaw / $ETH_DECIMALS
-            $floorETH     = $floorRaw / $ETH_DECIMALS
+            $peakETH      = $peakRaw / $script:BASE_DECIMALS_SCALE
+            $floorETH     = $floorRaw / $script:BASE_DECIMALS_SCALE
             $pctFromPeak  = (($tRaw - $peakRaw) / $peakRaw) * 100.0
 
             $trailDist    = $peakRaw - $floorRaw
@@ -306,14 +317,14 @@ while ($iteration -lt $MaxIterations) {
                 $color = "White"
             }
 
-            Write-Host ("[$ts2] POST-ENTRY  - {0:F8} ETH  peak: {1:F8}  floor: {2:F8}  ({3:F4}% from peak)" -f `
-                $tETH, $peakETH, $floorETH, $pctFromPeak) -ForegroundColor $color
+            Write-Host ("[$ts2] POST-ENTRY  - {0:F8} {4}  peak: {1:F8} {4}  floor: {2:F8} {4}  ({3:F4}% from peak)" -f `
+                $tETH, $peakETH, $floorETH, $pctFromPeak, $script:BaseLabel) -ForegroundColor $color
 
             if ($tRaw -le $floorRaw) {
                 $entryETH = [double]$Amount
                 $gainPct  = (($tETH - $entryETH) / $entryETH) * 100.0
                 Write-Host ""
-                Write-Host ("Trail floor breached! {0:F8} ETH back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct) -ForegroundColor Red
+                Write-Host ("Trail floor breached! {0:F8} {2} back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct, $script:BaseLabel) -ForegroundColor Red
                 Run-Sell $tokenStr
             }
             continue
@@ -332,22 +343,22 @@ while ($iteration -lt $MaxIterations) {
             $color = "DarkGray"
         }
 
-        Write-Host ("[$ts2] Price: {0:F8} ETH  win-high: {1:F8}  ({2:+0.0000}%)  thresh: {3:+0.0000}% away" -f `
-            $currentETH, $windowHighETH, $pctVsHigh, $pctVsThresh) -ForegroundColor $color
+        Write-Host ("[$ts2] Price: {0:F8} {4}  win-high: {1:F8} {4}  ({2:F4}%)  thresh: {3:F4}% away" -f `
+            $currentETH, $windowHighETH, $pctVsHigh, $pctVsThresh, $script:BaseLabel) -ForegroundColor $color
 
         # Breakout condition
         if ($currentRaw -ge $breakoutThresh) {
             Write-Host ""
-            Write-Host ("BREAKOUT detected! Price {0:F8} ETH >= threshold {1:F8} ETH  (+{2:F4}% vs window high)" -f `
-                $currentETH, ($breakoutThresh / $ETH_DECIMALS), $pctVsHigh) -ForegroundColor Green
+            Write-Host ("BREAKOUT detected! Price {0:F8} {3} >= threshold {1:F8} {3}  (+{2:F4}% vs window high)" -f `
+                $currentETH, ($breakoutThresh / $script:BASE_DECIMALS_SCALE), $pctVsHigh, $script:BaseLabel) -ForegroundColor Green
 
             # ── Volume confirmation check ──────────────────────────────────────
             $skipEntry = $false
             if ($VolumeConfirm) {
                 try {
                     $largeAmountStr = ([double]$Amount * $VolumeMultiple).ToString("F8")
-                    $smallQ  = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
-                    $largeQ  = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $largeAmountStr
+                    $smallQ  = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
+                    $largeQ  = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $largeAmountStr
                     $smallPPU = [double]$smallQ.buyAmount / [double]$Amount
                     $largePPU = [double]$largeQ.buyAmount / [double]$largeAmountStr
                     $impactPct = if ($largePPU -gt 0) { ($smallPPU / $largePPU - 1.0) * 100.0 } else { 0.0 }
@@ -368,31 +379,34 @@ while ($iteration -lt $MaxIterations) {
             if ($skipEntry) { continue }
 
             if ($DryRun) {
-                Write-Host "  [DRY-RUN] Would BUY $Amount ETH of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                Write-Host "  [DRY-RUN] Would BUY $Amount $($script:BaseLabel) of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                $dryRunBreakoutSeen = $true
             } else {
                 Write-Host ""
-                Write-Host "Executing breakout buy: $Amount ETH -> $TokenLabel" -ForegroundColor Green
-                Write-Host ">>> speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor Cyan
-                speed swap -c $Chain --sell eth --buy $Token -a $Amount -y
+                Write-Host "Executing breakout buy: $Amount $($script:BaseLabel) -> $TokenLabel" -ForegroundColor Green
+                Write-Host ">>> speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor Cyan
+                speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y
                 if ($LASTEXITCODE -ne 0) {
                     Write-Error "Breakout buy failed (exit $LASTEXITCODE). Aborting."
                     exit $LASTEXITCODE
                 }
+                $actTokenRaw = $refTokenRaw
+                $actTokenHuman = $actTokenRaw / $TOKEN_SCALE
+                $refTokenStr   = $actTokenHuman.ToString("F$tokenDecimals")
                 Write-Host ""
 
                 # Get current sell quote to anchor trail peak
                 Write-Host "Getting post-buy sell quote to anchor trailing stop..." -ForegroundColor DarkCyan
-                $postBuyQ  = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+                $postBuyQ  = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
                 $postBuyRaw= [double]$postBuyQ.buyAmount
-                # Use refTokenStr as the tokenStr for trailing stop (the amount we'd get for Amount ETH)
                 $tokenStr  = $refTokenStr
                 $peakRaw   = $postBuyRaw
                 $floorRaw  = $peakRaw * (1.0 - $TrailPct / 100.0)
                 $entryMade = $true
 
-                Write-Host ("  Entry price   : {0:F8} ETH  (for {1} {2})" -f ($postBuyRaw / $ETH_DECIMALS), $tokenStr, $TokenLabel) -ForegroundColor DarkGray
-                Write-Host ("  Trail peak    : {0:F8} ETH" -f ($peakRaw / $ETH_DECIMALS)) -ForegroundColor DarkGray
-                Write-Host ("  Trail floor   : {0:F8} ETH  (-{1}%)" -f ($floorRaw / $ETH_DECIMALS), $TrailPct) -ForegroundColor DarkGray
+                Write-Host ("  Entry price   : {0:F8} {3}  (for {1} {2})" -f ($postBuyRaw / $script:BASE_DECIMALS_SCALE), $tokenStr, $TokenLabel, $script:BaseLabel) -ForegroundColor DarkGray
+                Write-Host ("  Trail peak    : {0:F8} {1}" -f ($peakRaw / $script:BASE_DECIMALS_SCALE), $script:BaseLabel) -ForegroundColor DarkGray
+                Write-Host ("  Trail floor   : {0:F8} {2}  (-{1}%)" -f ($floorRaw / $script:BASE_DECIMALS_SCALE), $TrailPct, $script:BaseLabel) -ForegroundColor DarkGray
                 Write-Host ""
             }
         }
@@ -408,6 +422,9 @@ Write-Host ""
 if ($entryMade) {
     Write-Host "Max iterations ($MaxIterations) reached. Selling position..." -ForegroundColor Yellow
     Run-Sell $tokenStr
+} elseif ($DryRun -and $dryRunBreakoutSeen) {
+    Write-Host "Max iterations ($MaxIterations) reached. Dry-run logged breakout signal(s); no on-chain trade." -ForegroundColor Yellow
+    exit 0
 } else {
     Write-Host "Max iterations ($MaxIterations) reached. No breakout detected. Exiting without a trade." -ForegroundColor Yellow
     exit 0

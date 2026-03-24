@@ -1,3 +1,16 @@
+## v2: configurable base token
+
+Same behavior as `../scripts/<this-folder>/`, but the **quote currency** is not hard-coded to **ETH**. Use:
+
+| | |
+|---|---|
+| **PowerShell** | `-BaseToken` (default `speed`), optional `-BaseTokenSymbol` |
+| **Bash** | `--base-token` (default `speed`), optional `--base-token-symbol` |
+
+Spend/quote amounts (e.g. `-Amount`, `-TotalAmount`, `-BasePerGrid`, `-BasePerRung`) are in **units of the base token**. Use `../scripts/` if you want ETH-only bots unchanged.
+
+---
+
 # Grid Trading Skill
 
 Complete reference for `grid-trade-any.ps1` and `grid-trade-any.sh` — grid trading bots built on the `speed` CLI.
@@ -28,7 +41,7 @@ Grid trading profits from a price that oscillates within a range, without requir
 
 **How profit is made:**
 
-Each round-trip (buy at level N, sell at level N-1) earns approximately `GridPct%` gross on that position, minus two swap fees. For example, with `GridPct = 2%` and `EthPerGrid = 0.001 ETH`, one completed round-trip returns ~0.00002 ETH gross minus gas costs.
+Each round-trip (buy at level N, sell at level N-1) earns approximately `GridPct%` gross on that position, minus two swap fees. For example, with `GridPct = 2%` and `BasePerGrid = 200` **speed**, one completed round-trip returns ~**4** **speed** gross before fees (labels follow `-BaseToken`). Dry-run reference: `../LIVE-TEST-1000-SPEED.md` (**~197.6 speed** “base” price for the grid’s reference size).
 
 **Key risk:** If price drops below all grid levels and does not recover, all cells become filled (capital fully deployed). No further sells occur until price recovers. At `MaxIterations`, all filled cells are sold at the prevailing market price which may be below the buy levels.
 
@@ -39,16 +52,18 @@ Each round-trip (buy at level N, sell at level N-1) earns approximately `GridPct
 | Parameter (PS1) | Flag (SH) | Type | Default | Description |
 |---|---|---|---|---|
 | `-Chain` | `--chain` | string | required | Chain name or ID (`base`, `ethereum`, `arbitrum`, etc.) |
-| `-Token` | `--token` | string | required | Token contract address or alias (`speed`). ETH is always the quote currency. |
-| `-EthPerGrid` | `--eth-per-grid` | string/number | required | ETH to spend at each buy level. Minimum ~0.0001 ETH (0x dust limit). |
+| `-Token` | `--token` | string | required | Token contract address or alias (the asset being grid-traded). |
+| `-BasePerGrid` | `--eth-per-grid` | string/number | required | Base token to spend at each buy level. Bash keeps the legacy flag name `--eth-per-grid`; value is **base token** units (same as PS1 `-BasePerGrid`). Min ~0.0001 **ETH-equivalent** on 0x. |
+| `-BaseToken` | `--base-token` | string | `speed` | Quote token address or alias (`speed`, `eth`, …). |
+| `-BaseTokenSymbol` | `--base-token-symbol` | string | `""` | Optional display label for the base token. |
 | `-Levels` | `--levels` | integer | required | Number of grid cells to create below current price. |
 | `-GridPct` | `--grid-pct` | float | required | Percentage spacing between adjacent grid levels (e.g. `2` = 2%). |
-| `-TokenSymbol` | `--token-symbol` | string | address | Display label for the token in output. |
+| `-TokenSymbol` | `--token-symbol` | string | `""` | Optional display label for the traded token. |
 | `-PollSeconds` | `--poll-seconds` | integer | `60` | Seconds between price polls. |
 | `-MaxIterations` | `--max-iterations` | integer | `2880` | Max polls before forcing an exit sell (~48 h at 60 s). |
 | `-DryRun` | `--dry-run` | switch | false | Simulate without executing any swaps. Quotes still run. |
 
-**Total capital required (worst case):** `EthPerGrid * Levels` ETH — this is the maximum outlay if all grid cells fill simultaneously.
+**Total capital required (worst case):** `BasePerGrid * Levels` in **base token** — maximum outlay if all grid cells fill simultaneously (plus gas).
 
 ---
 
@@ -56,17 +71,17 @@ Each round-trip (buy at level N, sell at level N-1) earns approximately `GridPct
 
 ### Price metric
 
-The bot measures price as: **how much ETH is returned for a fixed reference token amount** (`refTokenAmount`).
+The bot measures price as: **how much base token is returned for a fixed reference token amount** (`refTokenAmount`).
 
-`refTokenAmount` is determined at startup by quoting `EthPerGrid` ETH -> Token. This quantity is then used as the stable reference for all subsequent Token -> ETH price polls.
+`refTokenAmount` is determined at startup by quoting `BasePerGrid` **base token** → Token. This quantity is then used as the stable reference for all subsequent Token → base token price polls.
 
-A higher ETH return = higher token price. A lower ETH return = lower token price.
+A higher base return = higher token price. A lower base return = lower token price.
 
 ### Reference amount derivation
 
 ```
-Step 1: quote(ETH -> Token, amount=EthPerGrid) => refTokenAmount
-Step 2: quote(Token -> ETH, amount=refTokenAmount) => baseRaw (raw integer, ETH * 1e18)
+Step 1: quote(BaseToken -> Token, amount=BasePerGrid) => refTokenAmount
+Step 2: quote(Token -> BaseToken, amount=refTokenAmount) => baseRaw (raw integer, scaled by base-token decimals)
 ```
 
 `baseRaw` is the baseline price. All grid levels are derived from it.
@@ -108,10 +123,10 @@ Each cell follows this lifecycle:
 ```
 pending_buy
     |
-    | price drops to BuyLevel => invoke_buy(EthPerGrid)
+    | price drops to BuyLevel => invoke_buy(BasePerGrid)
     |
     v
-  filled  (TokenHeld = quoted token amount, EthSpent = EthPerGrid)
+  filled  (TokenHeld = quoted token amount, base spent = BasePerGrid)
     |
     | price rises to SellLevel => invoke_sell(TokenHeld)
     |
@@ -119,7 +134,7 @@ pending_buy
 pending_buy  (cell resets, ready for next buy)
 ```
 
-**On each poll, sells are processed before buys.** This ensures ETH is recouped before being committed to new positions.
+**On each poll, sells are processed before buys.** This ensures base token is recouped before being committed to new positions.
 
 **Multiple levels can trigger in one poll** if the price jumps several grid steps between polls. All eligible cells are processed in a single pass.
 
@@ -132,22 +147,22 @@ pending_buy  (cell resets, ready for next buy)
 ### PowerShell — common scenarios
 
 ```powershell
-# SPEED token, 5 levels, 2% grid, 0.001 ETH per level
-.\grid-trade-any.ps1 -Chain base -Token speed -EthPerGrid 0.001 -Levels 5 -GridPct 2
+# SPEED token, 5 levels, 2% grid, 0.001 speed per level (default base)
+.\grid-trade-any.ps1 -Chain base -Token speed -BasePerGrid 0.001 -Levels 5 -GridPct 2
 
 # cbBTC, 3 levels, 1.5% grid, 30-second polls
 .\grid-trade-any.ps1 -Chain base `
     -Token 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf `
     -TokenSymbol cbBTC `
-    -EthPerGrid 0.002 -Levels 3 -GridPct 1.5 -PollSeconds 30
+    -BasePerGrid 0.002 -Levels 3 -GridPct 1.5 -PollSeconds 30
 
 # Dry run to preview grid before committing capital
 .\grid-trade-any.ps1 -Chain base -Token speed `
-    -EthPerGrid 0.001 -Levels 5 -GridPct 2 -DryRun
+    -BasePerGrid 0.001 -Levels 5 -GridPct 2 -DryRun
 
-# Tight grid, many levels (ensure EthPerGrid > 0.0001 ETH dust limit)
+# Tight grid, many levels (ensure BasePerGrid > 0.0001 ETH-equivalent dust limit)
 .\grid-trade-any.ps1 -Chain base -Token speed `
-    -EthPerGrid 0.0002 -Levels 10 -GridPct 1 -PollSeconds 30
+    -BasePerGrid 0.0002 -Levels 10 -GridPct 1 -PollSeconds 30
 ```
 
 ### Bash — common scenarios
@@ -175,19 +190,19 @@ chmod +x grid-trade-any.sh
 
 ## 6. Reading the Status Table
 
-Example output during a poll:
+Example output during a poll (magnitudes aligned with Base **cbBTC** grid dry-run: **200 speed** per cell, **~197.6 speed** session **base** in `../LIVE-TEST-1000-SPEED.md`; **~0.00000066 cbBTC** per buy quoted there):
 
 ```
-[14:32:01] Price: 0.00001824 ETH  (base: 0.00001900, -4.00%)  Buys: 2  Sells: 1
-          P/L: -0.00100000 ETH   Spent: 0.00200000 ETH   Received: 0.00100000 ETH
+[14:32:01] Price: 190.84 speed  (base: 197.63, -3.44%)  Buys: 2  Sells: 1
+          P/L: -35.50 speed   Spent: 400.00 speed   Received: 364.50 speed
 
-  #    Buy Level ETH    Sell Level ETH  Status        Token Held              ETH Spent
-  -    --------------   --------------  ------------  ----------------------  ---------
-  0    0.00001862       0.00001900      FILLED  *     52341.50 SPEED          0.001
-  1    0.00001824       0.00001862      FILLED  *     53120.00 SPEED          0.001
-  2    0.00001786       0.00001824      waiting       -                       -
-  3    0.00001748       0.00001786      waiting       -                       -
-  4    0.00001710       0.00001748      waiting       -                       -
+  #    Buy lvl (speed)  Sell lvl (speed)  Status        Token Held              Spent (speed)
+  -    --------------   ----------------  ------------  ----------------------  --------------
+  0    193.67           197.63          FILLED  *     0.00000066 cbBTC          200
+  1    189.79           193.67          FILLED  *     0.00000067 cbBTC          200
+  2    185.92           189.79          waiting       -                       -
+  3    182.20           185.92          waiting       -                       -
+  4    178.62           182.20          waiting       -                       -
 ```
 
 **Column meanings:**
@@ -195,11 +210,11 @@ Example output during a poll:
 | Column | Description |
 |---|---|
 | `#` | Cell index (0 = closest to base price) |
-| `Buy Level ETH` | ETH return threshold that triggers a buy (price must drop to or below this) |
-| `Sell Level ETH` | ETH return threshold that triggers a sell (price must rise to or above this) |
+| `Buy lvl (base)` | Base-token return threshold that triggers a buy (price must drop to or below this). Header uses your `-BaseToken` label (e.g. `speed`). |
+| `Sell lvl (base)` | Base-token return threshold that triggers a sell (price must rise to or above this). |
 | `Status` | `waiting` = no position open. `FILLED *` = token position held. |
 | `Token Held` | Quoted token amount bought at this cell. Used as the sell amount. |
-| `ETH Spent` | ETH spent to buy into this cell. |
+| `Spent (base)` | Base token spent to buy into this cell. |
 
 **Color coding (PS1):**
 - Cyan — cell is `FILLED` (holds a token position)
@@ -209,27 +224,27 @@ Example output during a poll:
 - Magenta (trigger line) — buy triggered
 
 **Header line fields:**
-- `Price` — current ETH return for the reference token amount
+- `Price` — current base-token return for the reference token amount
 - `base` — the price captured at startup; all levels derived from this
 - `%` — how far current price has moved from base (negative = price dropped)
 - `Buys / Sells` — cumulative count for the session
-- `P/L` — net ETH profit/loss for the session so far
+- `P/L` — net base-token profit/loss for the session so far
 
 ---
 
 ## 7. P/L Interpretation
 
-**`total_eth_spent`** — sum of all `EthPerGrid` amounts across completed buys. Incremented immediately when a buy executes.
+**`totalEthSpent` (display: base spent)** — sum of all `BasePerGrid` amounts across completed buys. Incremented immediately when a buy executes.
 
-**`total_eth_received`** — estimated sum of ETH from all completed sells. After each sell swap, a second `quote` call estimates the ETH that would have been received. This is an approximation — actual received amount depends on slippage at execution time.
+**`totalEthReceived` (display: base received)** — estimated sum of base token from all completed sells. After each sell swap, a second `quote` call estimates the base token that would have been received. This is an approximation — actual received amount depends on slippage at execution time.
 
 **Running P/L formula:**
 
 ```
-P/L = total_eth_received - total_eth_spent
+P/L = total_received_base - total_spent_base
 ```
 
-A negative P/L during the session is normal when cells are filled but unsold. The `total_eth_spent` grows with each buy; `total_eth_received` only grows when sells execute.
+A negative P/L during the session is normal when cells are filled but unsold. Base spent grows with each buy; base received only grows when sells execute.
 
 **Break-even per cell:** each filled cell breaks even when its sell executes at `SellLevelRaw >= BuyLevelRaw * (1 + fee_fraction * 2)`. With ~0.05% swap fees each way, GridPct values above 0.2% cover fees. Practical minimum is 1% to leave meaningful margin after fee variance.
 
@@ -239,11 +254,11 @@ A negative P/L during the session is normal when cells are filled but unsold. Th
 
 | Pitfall | Details | Fix |
 |---|---|---|
-| `EthPerGrid` too small | 0x API rejects swaps below ~0.0001 ETH equivalent. Buy will throw an error and skip. | Use `EthPerGrid >= 0.0002` ETH. |
+| `BasePerGrid` too small | 0x API rejects swaps below ~0.0001 ETH equivalent. Buy will throw an error and skip. | Use `BasePerGrid >= 0.0002` in base units (or raise size until the API accepts). |
 | Price gap between polls crosses multiple levels | All eligible cells trigger in one pass. If price drops 6% between two polls on a 2% grid, three cells fire simultaneously. Capital use spikes. | Use shorter `PollSeconds` (30s) or wider `GridPct` to reduce simultaneous triggers. |
-| All cells filled, no ETH remaining | Grid is fully deployed. No further buys until sells execute. Session continues polling. | Ensure wallet holds enough ETH: `EthPerGrid * Levels + gas buffer`. |
+| All cells filled, no base remaining | Grid is fully deployed. No further buys until sells execute. Session continues polling. | Ensure wallet holds enough base token: `BasePerGrid * Levels + gas buffer`. |
 | Tight grids eaten by fees | 0.5% grid with 0.1% fees each way leaves only 0.3% net per round-trip — nearly zero after gas. | Keep `GridPct` at least 3-5x the round-trip fee (so >= 1% for typical 0x fees). |
-| Token held string rounds to zero | Tokens with very small decimals or very large supply may produce a tiny human amount. | Script aborts the buy with an error. Increase `EthPerGrid`. |
+| Token held string rounds to zero | Tokens with very small decimals or very large supply may produce a tiny human amount. | Script aborts the buy with an error. Increase `BasePerGrid`. |
 | `DryRun` P/L uses quote, not actual fill | Quote prices include 0x spread but not slippage. Real P/L will differ slightly. | Use `DryRun` for grid preview only; verify levels look sensible before going live. |
 | MaxIterations sells at a loss | If price never recovers, final forced sells execute below buy levels. | Set `MaxIterations` high enough to give the grid time to cycle. Alternatively, remove the max-iterations constraint by setting it to a very large number. |
 | Sell quote fails after swap | The P/L estimate after each sell uses a second quote call. If it fails, `total_eth_received` is not updated that cycle. The actual swap still executed. | Check terminal output for `Warning: sell quote failed` lines; P/L display may lag but trades are unaffected. |

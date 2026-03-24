@@ -21,6 +21,11 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../_common.sh
+source "$SCRIPT_DIR/../_common.sh"
+
+
 # --- defaults -----------------------------------------------------------------
 
 CHAIN=""
@@ -35,6 +40,8 @@ ARM_TIMEOUT=0
 POLL_SECONDS=60
 MAX_ITERATIONS=1440
 DRY_RUN=0
+BASE_TOKEN="speed"
+BASE_TOKEN_SYMBOL=""
 
 # --- arg parsing --------------------------------------------------------------
 
@@ -52,6 +59,8 @@ while [[ $# -gt 0 ]]; do
         --pollseconds)     POLL_SECONDS="$2";    shift 2 ;;
         --maxiterations)   MAX_ITERATIONS="$2";  shift 2 ;;
         --dry-run)         DRY_RUN=1;            shift ;;
+        --base-token)         BASE_TOKEN="$2";       shift 2 ;;
+        --base-token-symbol) BASE_TOKEN_SYMBOL="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -59,6 +68,19 @@ done
 if [[ -z "$CHAIN" || -z "$TOKEN" || -z "$AMOUNT" ]]; then
     echo "Usage: $0 --chain <chain> --token <addr|alias> --amount <eth> [--window-polls <n>] [--compression-pct <pct>] [--expansion-pct <pct>] [--trail-pct <pct>] [--arm-timeout <n>] [--tokensymbol <name>] [--pollseconds <s>] [--maxiterations <n>] [--dry-run]" >&2
     exit 1
+fi
+
+BASE_TOKEN="$(speed_v2_resolve_base_token "$TOKEN" "$BASE_TOKEN")"
+BASE_DECIMALS=$(speed_v2_get_token_decimals "$BASE_TOKEN" "$CHAIN")
+BASE_SCALE=$(awk "BEGIN { printf \"%.0f\", 10 ^ $BASE_DECIMALS }")
+BASE_LABEL="$(speed_v2_base_label "$BASE_TOKEN_SYMBOL" "$BASE_TOKEN")"
+
+if awk -v e="$EXPANSION_PCT" 'BEGIN { exit (e < 0) ? 0 : 1 }'; then
+    echo "-ExpansionPct must be >= 0." >&2
+    exit 1
+fi
+if awk -v e="$EXPANSION_PCT" 'BEGIN { exit (e == 0) ? 0 : 1 }'; then
+    echo "Warning: -ExpansionPct 0: any price at or above window high while armed triggers entry." >&2
 fi
 
 # --- colours ------------------------------------------------------------------
@@ -88,91 +110,60 @@ get_rpc_url() {
 
 # --- helpers ------------------------------------------------------------------
 
-ETH_SCALE=1000000000000000000
 
-to_human_eth() {
-    awk "BEGIN { printf \"%.8f\", $1 / $ETH_SCALE }"
+to_human_base() {
+    awk "BEGIN { printf \"%.8f\", $1 / $BASE_SCALE }"
 }
 
 format_token() {
     awk "BEGIN { printf \"%.*f\", $2, $1 }"
 }
 
-extract_buy_amount() {
-    local json="$1"
-    echo "$json" | grep -oP '"buyAmount"\s*:\s*"\K[^"]+' 2>/dev/null || \
-    echo "$json" | grep -oP '"buyAmount"\s*:\s*\K[0-9]+' 2>/dev/null || \
-    echo ""
-}
+extract_buy_amount() { speed_v2_extract_buy_amount "$1"; }
 
-get_token_decimals() {
-    local token_addr="$1" chain="$2"
-    local lower="${token_addr,,}"
-    [[ "$lower" =~ ^(speed|eth|ether|native)$ ]] && echo 18 && return
-    [[ "$lower" != 0x* ]] && echo 18 && return
-
-    local rpc
-    rpc=$(get_rpc_url "$chain")
-    if [[ -z "$rpc" ]]; then
-        echo "Warning: unknown chain '$chain', assuming 18 decimals." >&2; echo 18; return
-    fi
-
-    local body="{\"jsonrpc\":\"2.0\",\"method\":\"eth_call\",\"params\":[{\"to\":\"$token_addr\",\"data\":\"0x313ce567\"},\"latest\"],\"id\":1}"
-    local resp
-    resp=$(curl -sf -X POST "$rpc" -H "Content-Type: application/json" -d "$body" 2>/dev/null) || {
-        echo "Warning: RPC call failed, assuming 18 decimals." >&2; echo 18; return
-    }
-
-    local result_field hex
-    result_field=$(echo "$resp" | grep -oP '"result"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
-    if [[ -z "$result_field" || "$result_field" == "0x" ]]; then
-        echo "Warning: empty decimals result, assuming 18." >&2; echo 18; return
-    fi
-
-    hex="${result_field#0x}"
-    hex=$(echo "$hex" | sed 's/^0*//')
-    [[ -z "$hex" ]] && hex="0"
-    echo "obase=10; ibase=16; ${hex^^}" | bc 2>/dev/null || echo 18
-}
+get_token_decimals() { speed_v2_get_token_decimals "$1" "$2"; }
 
 get_quote() {
     local sell_tok="$1" buy_tok="$2" sell_amt="$3"
-    local output json
-    output=$(speed quote --json -c "$CHAIN" --sell "$sell_tok" --buy "$buy_tok" -a "$sell_amt" 2>&1)
-    json=$(echo "$output" | grep -m1 '^{' || echo "")
-    if [[ -z "$json" ]]; then
-        echo "No JSON from quote. Output: $output" >&2; return 1
-    fi
-    if echo "$json" | grep -q '"error"'; then
-        local err
-        err=$(echo "$json" | grep -oP '"error"\s*:\s*"\K[^"]+' || echo "$json")
-        echo "Quote error: $err" >&2; return 1
-    fi
-    echo "$json"
+    speed_v2_get_quote "$CHAIN" "$sell_tok" "$buy_tok" "$sell_amt"
 }
 
 awk_gte() { awk "BEGIN { exit ($1 >= $2) ? 0 : 1 }"; }
 awk_lte() { awk "BEGIN { exit ($1 <= $2) ? 0 : 1 }"; }
 awk_gt()  { awk "BEGIN { exit ($1 > $2)  ? 0 : 1 }"; }
 
-# Rolling window as space-separated values
-WINDOW_DATA=""
+# Rolling window: raw wei (for max / expansion) + human base (range/mean; awk cannot sum wei-sized ints)
+WINDOW_RAW=""
+WINDOW_HUMAN=""
+
+window_max_raw() {
+    echo "$WINDOW_RAW" | tr ' ' '\n' | grep -v '^$' | sort -n | tail -1
+}
 
 window_add() {
     local val="$1"
-    WINDOW_DATA="$WINDOW_DATA $val"
+    local h
+    h=$(to_human_base "$val")
+    if [[ -z "$WINDOW_RAW" ]]; then
+        WINDOW_RAW="$val"
+        WINDOW_HUMAN="$h"
+    else
+        WINDOW_RAW="$WINDOW_RAW $val"
+        WINDOW_HUMAN="$WINDOW_HUMAN $h"
+    fi
     local count
-    count=$(echo "$WINDOW_DATA" | wc -w)
+    count=$(echo "$WINDOW_RAW" | wc -w)
     if (( count > WINDOW_POLLS )); then
-        WINDOW_DATA=$(echo "$WINDOW_DATA" | awk '{for(i=2;i<=NF;i++) printf $i" "; print ""}' | sed 's/ $//')
+        WINDOW_RAW=$(echo "$WINDOW_RAW" | awk '{for(i=2;i<=NF;i++) printf $i" "; print ""}' | sed 's/ $//')
+        WINDOW_HUMAN=$(echo "$WINDOW_HUMAN" | awk '{for(i=2;i<=NF;i++) printf $i" "; print ""}' | sed 's/ $//')
     fi
 }
 
 window_stats() {
-    echo "$WINDOW_DATA" | tr ' ' '\n' | grep -v '^$' | \
-        awk 'BEGIN{max=-1e18;min=1e18;sum=0;n=0}
+    echo "$WINDOW_HUMAN" | tr ' ' '\n' | grep -v '^$' | \
+        awk 'BEGIN{max=-1e308;min=1e308;sum=0;n=0}
              {v=$1+0; if(v>max)max=v; if(v<min)min=v; sum+=v; n++}
-             END{if(n>0) printf "%.0f %.0f %.0f", max, min, sum/n; else print "0 0 0"}'
+             END{if(n>0) printf "%.10f %.10f %.10f", max, min, sum/n; else print "0 0 0"}'
 }
 
 # --- setup --------------------------------------------------------------------
@@ -194,10 +185,10 @@ echo -e "${YELLOW}=== Speed Compression Buy ===${RESET}"
 [[ "$DRY_RUN" == "1" ]] && echo -e "${YELLOW}  *** DRY-RUN MODE -- compression signals logged, no buy will execute ***${RESET}"
 echo "  Chain           : $CHAIN"
 echo "  Token           : $TOKEN_LABEL  (decimals: $TOKEN_DECIMALS)"
-echo "  Buy amount      : $AMOUNT ETH  (on expansion breakout)"
+echo "  Buy amount      : $AMOUNT $BASE_LABEL  (on expansion breakout)"
 echo "  Window polls    : $WINDOW_POLLS  (rolling range + mean)"
-echo "  Compression     : <= ${COMPRESSION_PCT}% range/mean  (arm condition)"
-echo "  Expansion       : +${EXPANSION_PCT}% above window high while armed  (entry)"
+echo "  Compression     : <= ${COMPRESSION_PCT} % range/mean  (arm condition)"
+echo "  Expansion       : +${EXPANSION_PCT} % above window high while armed  (entry)"
 echo "  Trail pct       : ${TRAIL_PCT}% drop from peak triggers sell"
 (( ARM_TIMEOUT > 0 )) && echo "  Arm timeout     : $ARM_TIMEOUT polls without expansion resets arm"
 echo "  Poll interval   : $POLL_SECONDS s"
@@ -206,26 +197,26 @@ echo ""
 
 # --- step 1: reference quote --------------------------------------------------
 
-echo -e "${CYAN}Step 1 - Quoting $AMOUNT ETH -> $TOKEN_LABEL (reference, no buy yet)...${RESET}"
+echo -e "${CYAN}Step 1 - Quoting $AMOUNT $BASE_LABEL -> $TOKEN_LABEL (reference, no buy yet)...${RESET}"
 
-ref_buy_json=$(get_quote "eth" "$TOKEN" "$AMOUNT")
+ref_buy_json=$(get_quote "$BASE_TOKEN" "$TOKEN" "$AMOUNT")
 ref_token_raw=$(extract_buy_amount "$ref_buy_json")
 [[ -z "$ref_token_raw" ]] && { echo "Failed to parse ref buyAmount. Aborting." >&2; exit 1; }
 ref_token_human=$(awk "BEGIN { printf \"%.${TOKEN_DECIMALS}f\", $ref_token_raw / $TOKEN_SCALE }")
 ref_token_str=$(format_token "$ref_token_human" "$TOKEN_DECIMALS")
 awk_gt "$ref_token_str" "0" || { echo "Reference amount resolved to 0. Aborting." >&2; exit 1; }
-echo "  Reference amount : $ref_token_str $TOKEN_LABEL for $AMOUNT ETH"
+echo "  Reference amount : $ref_token_str $TOKEN_LABEL for $AMOUNT $BASE_LABEL"
 
 # --- step 2: initial price ----------------------------------------------------
 
 echo ""
 echo -e "${CYAN}Step 2 - Getting initial price...${RESET}"
 
-init_sell_json=$(get_quote "$TOKEN" "eth" "$ref_token_str")
+init_sell_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str")
 init_raw=$(extract_buy_amount "$init_sell_json")
 [[ -z "$init_raw" ]] && { echo "Failed to parse initial price. Aborting." >&2; exit 1; }
-init_eth=$(to_human_eth "$init_raw")
-echo "  Initial price : $init_eth ETH  (for $ref_token_str $TOKEN_LABEL)"
+init_eth=$(to_human_base "$init_raw")
+echo "  Initial price : $init_eth $BASE_LABEL  (for $ref_token_str $TOKEN_LABEL)"
 echo ""
 
 window_add "$init_raw"
@@ -243,7 +234,7 @@ while (( warmup_done < warmup_needed )); do
     echo -e "${GRAY}[$ts] Warm-up $warmup_done/$warmup_needed - waiting $POLL_SECONDS s...${RESET}"
     sleep "$POLL_SECONDS"
 
-    poll_json=$(get_quote "$TOKEN" "eth" "$ref_token_str" 2>&1) || {
+    poll_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str" 2>&1) || {
         echo "Warning: warm-up poll $warmup_done failed - using last known."
         window_add "$init_raw"
         continue
@@ -253,21 +244,21 @@ while (( warmup_done < warmup_needed )); do
         window_add "$init_raw"
         continue
     fi
-    w_eth=$(to_human_eth "$w_raw")
+    w_eth=$(to_human_base "$w_raw")
     read -r w_high w_low w_mean <<< "$(window_stats)"
     w_range=$(awk "BEGIN { printf \"%.2f\", ($w_mean > 0) ? ($w_high - $w_low) / $w_mean * 100 : 0 }")
-    w_count=$(echo "$WINDOW_DATA" | wc -w)
+    w_count=$(echo "$WINDOW_RAW" | wc -w)
     ts2=$(date +"%H:%M:%S")
-    echo -e "${GRAY}[$ts2] Price: $w_eth ETH  range: ${w_range}%  compress<=${COMPRESSION_PCT}%  [$w_count samples]${RESET}"
+    echo -e "${GRAY}[$ts2] Price: $w_eth $BASE_LABEL  range: ${w_range}%  compress<=${COMPRESSION_PCT}%  [$w_count samples]${RESET}"
     window_add "$w_raw"
 done
 
 read -r w_high w_low w_mean <<< "$(window_stats)"
 w_range=$(awk "BEGIN { printf \"%.2f\", ($w_mean > 0) ? ($w_high - $w_low) / $w_mean * 100 : 0 }")
-w_mean_eth=$(to_human_eth "$w_mean")
+w_mean_eth="$w_mean"
 
 echo ""
-echo -e "${CYAN}Warm-up complete. Range: ${w_range}%  Mean: $w_mean_eth ETH  ($WINDOW_POLLS polls)${RESET}"
+echo -e "${CYAN}Warm-up complete. Range: ${w_range}%  Mean: $w_mean_eth $BASE_LABEL  ($WINDOW_POLLS polls)${RESET}"
 echo ""
 
 # --- step 4: monitoring -------------------------------------------------------
@@ -283,35 +274,35 @@ while (( iteration < MAX_ITERATIONS )); do
     echo -e "${GRAY}[$ts] Poll $iteration / $MAX_ITERATIONS - waiting $POLL_SECONDS s...${RESET}"
     sleep "$POLL_SECONDS"
 
-    poll_json=$(get_quote "$TOKEN" "eth" "$ref_token_str" 2>&1) || {
+    poll_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str" 2>&1) || {
         echo "Warning: quote failed on poll $iteration - retrying."
         continue
     }
     current_raw=$(extract_buy_amount "$poll_json")
     [[ -z "$current_raw" ]] && { echo "Warning: empty buyAmount on poll $iteration - retrying."; continue; }
-    current_eth=$(to_human_eth "$current_raw")
+    current_eth=$(to_human_base "$current_raw")
     ts2=$(date +"%H:%M:%S")
 
     # Update rolling window and recompute stats
     window_add "$current_raw"
-    read -r window_high window_low rolling_mean <<< "$(window_stats)"
-    window_high_eth=$(to_human_eth "$window_high")
-    range_ratio=$(awk "BEGIN { printf \"%.2f\", ($rolling_mean > 0) ? ($window_high - $window_low) / $rolling_mean * 100 : 0 }")
+    read -r window_high_eth window_low_eth rolling_mean_eth <<< "$(window_stats)"
+    window_high_raw=$(window_max_raw)
+    range_ratio=$(awk "BEGIN { printf \"%.2f\", ($rolling_mean_eth > 0) ? ($window_high_eth - $window_low_eth) / $rolling_mean_eth * 100 : 0 }")
 
     # ── post-entry: trailing stop ──────────────────────────────────────────────
     if [[ "$entry_made" == "1" ]]; then
-        tq_json=$(get_quote "$TOKEN" "eth" "$token_str" 2>&1) || { echo "Warning: trail quote failed - retrying."; continue; }
+        tq_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$token_str" 2>&1) || { echo "Warning: trail quote failed - retrying."; continue; }
         t_raw=$(extract_buy_amount "$tq_json")
         [[ -z "$t_raw" ]] && { echo "Warning: empty trail buyAmount - retrying."; continue; }
-        t_eth=$(to_human_eth "$t_raw")
+        t_eth=$(to_human_base "$t_raw")
 
         if awk_gt "$t_raw" "$peak_raw"; then
             peak_raw="$t_raw"
             floor_raw=$(awk "BEGIN { printf \"%.0f\", $peak_raw * (1 - $TRAIL_PCT / 100) }")
         fi
 
-        peak_eth=$(to_human_eth "$peak_raw")
-        floor_eth=$(to_human_eth "$floor_raw")
+        peak_eth=$(to_human_base "$peak_raw")
+        floor_eth=$(to_human_base "$floor_raw")
         pct_from_peak=$(awk "BEGIN { printf \"%.4f\", ($t_raw - $peak_raw) / $peak_raw * 100 }")
         trail_dist=$(awk "BEGIN { printf \"%.0f\", $peak_raw - $floor_raw }")
         dist_to_floor=$(awk "BEGIN { printf \"%.0f\", $t_raw - $floor_raw }")
@@ -320,15 +311,15 @@ while (( iteration < MAX_ITERATIONS )); do
         elif awk "BEGIN { exit ($trail_dist > 0 && $dist_to_floor / $trail_dist < 0.25) ? 0 : 1 }"; then color="$RED"
         else color="$WHITE"; fi
 
-        echo -e "${color}[$ts2] POST-ENTRY  $t_eth ETH  peak: $peak_eth  floor: $floor_eth  (${pct_from_peak}% from peak)${RESET}"
+        echo -e "${color}[$ts2] POST-ENTRY  $t_eth $BASE_LABEL  peak: $peak_eth  floor: $floor_eth  (${pct_from_peak}% from peak)${RESET}"
 
         if awk_lte "$t_raw" "$floor_raw"; then
             gain_pct=$(awk "BEGIN { printf \"%.4f\", ($t_eth - $AMOUNT) / $AMOUNT * 100 }")
             echo ""
-            echo -e "${RED}Trail floor breached! $t_eth ETH back  (${gain_pct}% vs entry cost)${RESET}"
-            if [[ "$DRY_RUN" == "1" ]]; then echo -e "${YELLOW}[DRY-RUN] Would SELL $token_str $TOKEN_LABEL -> ETH${RESET}"; exit 0; fi
-            echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy eth -a $token_str -y${RESET}"
-            speed swap -c "$CHAIN" --sell "$TOKEN" --buy eth -a "$token_str" -y
+            echo -e "${RED}Trail floor breached! $t_eth $BASE_LABEL back  (${gain_pct}% vs entry cost)${RESET}"
+            if [[ "$DRY_RUN" == "1" ]]; then echo -e "${YELLOW}[DRY-RUN] Would SELL $token_str $TOKEN_LABEL -> $BASE_LABEL${RESET}"; exit 0; fi
+            echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy ${BASE_TOKEN} -a $token_str -y${RESET}"
+            speed swap -c "$CHAIN" --sell "$TOKEN" --buy "$BASE_TOKEN" -a "$token_str" -y
             exit $?
         fi
         continue
@@ -340,10 +331,10 @@ while (( iteration < MAX_ITERATIONS )); do
 
     if (( armed == 1 && is_compressed == 0 )); then
         armed=0; arm_poll_count=0
-        echo -e "${GRAY}[$ts2] COMPRESSION  range: ${range_ratio}%  mean: $(to_human_eth "$rolling_mean")  [COMPRESSION LOST]${RESET}"
+        echo -e "${GRAY}[$ts2] COMPRESSION  range: ${range_ratio}%  mean: $rolling_mean_eth $BASE_LABEL  [COMPRESSION LOST]${RESET}"
     elif (( armed == 0 && is_compressed == 1 )); then
         armed=1; arm_poll_count=0
-        echo -e "${CYAN}[$ts2] COMPRESSION  range: ${range_ratio}% <= ${COMPRESSION_PCT}%  mean: $(to_human_eth "$rolling_mean") -- ARMED${RESET}"
+        echo -e "${CYAN}[$ts2] COMPRESSION  range: ${range_ratio}% <= ${COMPRESSION_PCT}%  mean: $rolling_mean_eth $BASE_LABEL -- ARMED${RESET}"
     elif (( armed == 1 )); then
         (( arm_poll_count++ )) || true
         if (( ARM_TIMEOUT > 0 && arm_poll_count >= ARM_TIMEOUT )); then
@@ -353,13 +344,13 @@ while (( iteration < MAX_ITERATIONS )); do
     fi
 
     # ── expansion breakout check (only when armed) ─────────────────────────────
-    expansion_thresh=$(awk "BEGIN { printf \"%.0f\", $window_high * (1 + $EXPANSION_PCT / 100) }")
-    expansion_thresh_eth=$(to_human_eth "$expansion_thresh")
-    pct_vs_high=$(awk "BEGIN { printf \"%+.4f\", ($current_raw - $window_high) / $window_high * 100 }")
+    expansion_thresh=$(awk -v w="$window_high_raw" -v p="$EXPANSION_PCT" 'BEGIN { printf "%.0f", w * (1 + p / 100) }')
+    expansion_thresh_eth=$(to_human_base "$expansion_thresh")
+    pct_vs_high=$(awk -v c="$current_raw" -v wh="$window_high_raw" 'BEGIN { printf "%+.4f", (c - wh) / wh * 100 }')
 
     if (( armed == 1 )); then
         if awk_gte "$current_raw" "$expansion_thresh"; then color="$GREEN"
-        elif awk "BEGIN { exit ($current_raw >= $window_high) ? 0 : 1 }"; then color="$YELLOW"
+        elif awk -v c="$current_raw" -v wh="$window_high_raw" 'BEGIN { exit (c >= wh) ? 0 : 1 }'; then color="$YELLOW"
         else color="$CYAN"; fi
         armed_label="ARMED"
     else
@@ -367,27 +358,27 @@ while (( iteration < MAX_ITERATIONS )); do
         armed_label="watching"
     fi
 
-    echo -e "${color}[$ts2] [$armed_label] price: $current_eth  win-high: $window_high_eth  range: ${range_ratio}%  exp-thresh: $expansion_thresh_eth  (${pct_vs_high}% vs high)${RESET}"
+    echo -e "${color}[$ts2] [$armed_label] price: $current_eth $BASE_LABEL  win-high: $window_high_eth $BASE_LABEL  range: ${range_ratio}%  exp-thresh: $expansion_thresh_eth $BASE_LABEL  (${pct_vs_high}% vs high)${RESET}"
 
     if (( armed == 1 )); then
         if awk_gte "$current_raw" "$expansion_thresh"; then
             echo ""
-            echo -e "${GREEN}EXPANSION BREAKOUT! Price $current_eth ETH >= $expansion_thresh_eth ETH while compressed  (+${pct_vs_high}% vs window high)${RESET}"
+            echo -e "${GREEN}EXPANSION BREAKOUT! Price $current_eth $BASE_LABEL >= $expansion_thresh_eth $BASE_LABEL while compressed  (+${pct_vs_high}% vs window high)${RESET}"
 
             if [[ "$DRY_RUN" == "1" ]]; then
-                echo -e "${YELLOW}  [DRY-RUN] Would BUY $AMOUNT ETH of $TOKEN_LABEL now. Continuing to observe...${RESET}"
+                echo -e "${YELLOW}  [DRY-RUN] Would BUY $AMOUNT $BASE_LABEL of $TOKEN_LABEL now. Continuing to observe...${RESET}"
                 armed=0
             else
                 echo ""
-                echo -e "${GREEN}Executing compression breakout buy: $AMOUNT ETH -> $TOKEN_LABEL${RESET}"
-                echo -e "${CYAN}>>> speed swap -c $CHAIN --sell eth --buy $TOKEN -a $AMOUNT -y${RESET}"
-                speed swap -c "$CHAIN" --sell eth --buy "$TOKEN" -a "$AMOUNT" -y || {
+                echo -e "${GREEN}Executing compression breakout buy: $AMOUNT $BASE_LABEL -> $TOKEN_LABEL${RESET}"
+                echo -e "${CYAN}>>> speed swap -c $CHAIN --sell ${BASE_TOKEN} --buy $TOKEN -a $AMOUNT -y${RESET}"
+                speed swap -c "$CHAIN" --sell "$BASE_TOKEN" --buy "$TOKEN" -a "$AMOUNT" -y || {
                     echo "Compression buy failed. Aborting." >&2; exit 1
                 }
                 echo ""
 
                 echo -e "${CYAN}Getting post-buy quote to anchor trailing stop...${RESET}"
-                post_buy_json=$(get_quote "$TOKEN" "eth" "$ref_token_str" 2>&1) || { echo "Post-buy quote failed. Aborting." >&2; exit 1; }
+                post_buy_json=$(get_quote "$TOKEN" "$BASE_TOKEN" "$ref_token_str" 2>&1) || { echo "Post-buy quote failed. Aborting." >&2; exit 1; }
                 post_buy_raw=$(extract_buy_amount "$post_buy_json")
                 [[ -z "$post_buy_raw" ]] && { echo "Empty post-buy raw. Aborting." >&2; exit 1; }
 
@@ -396,12 +387,12 @@ while (( iteration < MAX_ITERATIONS )); do
                 floor_raw=$(awk "BEGIN { printf \"%.0f\", $peak_raw * (1 - $TRAIL_PCT / 100) }")
                 entry_made=1
 
-                entry_eth=$(to_human_eth "$post_buy_raw")
-                peak_eth=$(to_human_eth "$peak_raw")
-                floor_eth=$(to_human_eth "$floor_raw")
-                echo -e "${GRAY}  Entry price  : $entry_eth ETH  (for $token_str $TOKEN_LABEL)${RESET}"
-                echo -e "${GRAY}  Trail peak   : $peak_eth ETH${RESET}"
-                echo -e "${GRAY}  Trail floor  : $floor_eth ETH  (-${TRAIL_PCT}%)${RESET}"
+                entry_eth=$(to_human_base "$post_buy_raw")
+                peak_eth=$(to_human_base "$peak_raw")
+                floor_eth=$(to_human_base "$floor_raw")
+                echo -e "${GRAY}  Entry price  : $entry_eth $BASE_LABEL  (for $token_str $TOKEN_LABEL)${RESET}"
+                echo -e "${GRAY}  Trail peak   : $peak_eth $BASE_LABEL${RESET}"
+                echo -e "${GRAY}  Trail floor  : $floor_eth $BASE_LABEL  (-${TRAIL_PCT}%)${RESET}"
                 echo ""
             fi
         fi
@@ -413,8 +404,8 @@ done
 echo ""
 if [[ "$entry_made" == "1" ]]; then
     echo -e "${YELLOW}Max iterations ($MAX_ITERATIONS) reached. Selling position...${RESET}"
-    echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy eth -a $token_str -y${RESET}"
-    speed swap -c "$CHAIN" --sell "$TOKEN" --buy eth -a "$token_str" -y
+    echo -e "${CYAN}>>> speed swap -c $CHAIN --sell $TOKEN --buy ${BASE_TOKEN} -a $token_str -y${RESET}"
+    speed swap -c "$CHAIN" --sell "$TOKEN" --buy "$BASE_TOKEN" -a "$token_str" -y
 else
     echo -e "${YELLOW}Max iterations ($MAX_ITERATIONS) reached. No expansion breakout detected. Exiting without a trade.${RESET}"
 fi

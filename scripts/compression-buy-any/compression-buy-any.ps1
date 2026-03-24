@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     1. Auto-detects token decimals via on-chain RPC call.
-    2. Quotes -Amount ETH -> <Token> to establish reference amount (no buy yet).
+    2. Quotes -Amount of -BaseToken -> <Token> to establish reference amount (no buy yet).
     3. Warm-up phase: polls -WindowPolls times to build the initial rolling window.
     4. Monitoring phase: each poll updates the rolling window and computes:
          rollingMean  = average of window prices
@@ -13,9 +13,9 @@
          compressionRatio = rollingRange / rollingMean * 100
        ARMED when compressionRatio <= CompressionPct (price band is tight).
        FIRES when armed AND currentPrice >= windowHigh * (1 + ExpansionPct/100).
-    5. On entry: executes the buy (-Amount ETH -> Token).
+    5. On entry: executes the buy (-Amount BaseToken -> Token).
     6. Post-buy exit: trailing stop, identical to momentum-any post-entry.
-       Peak rises on new highs; sells when ETH return drops -TrailPct% from peak.
+       Peak rises on new highs; sells when base return drops -TrailPct% from peak.
     7. Optional -ArmTimeout: if armed state persists this many polls without
        expansion, resets arm (avoids stale armed state in infinite sideways ranges).
     8. Falls back to selling after -MaxIterations if already bought.
@@ -32,10 +32,10 @@
 
 .PARAMETER Token
     Token contract address or shorthand alias ('speed').
-    ETH is always the quote currency.
+    Buy size and trail are denominated in -BaseToken (default: speed).
 
 .PARAMETER Amount
-    ETH to spend when a compression expansion is confirmed.
+    Amount of -BaseToken to spend when a compression expansion is confirmed.
 
 .PARAMETER WindowPolls
     Number of recent polls used for rolling range and mean calculations.
@@ -85,18 +85,20 @@ param(
     [string]  $TokenSymbol     = "",
     [int]     $WindowPolls     = 20,
     [double]  $CompressionPct  = 3.0,
-    [double]  $ExpansionPct    = 1.0,
+    [double]  $ExpansionPct    = 0.5,
     [double]  $TrailPct        = 5.0,
     [int]     $ArmTimeout      = 0,
     [int]     $PollSeconds     = 60,
     [int]     $MaxIterations   = 1440,
-    [switch]  $DryRun
+    [switch]  $DryRun,
+    [string]                       $BaseToken       = 'speed',
+    [string]                       $BaseTokenSymbol = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ETH_DECIMALS = [double]1e18
+. (Join-Path (Join-Path $PSScriptRoot '..') '_speed_json.ps1')
 
 $RPC_URLS = @{
     "base"     = "https://mainnet.base.org"
@@ -158,8 +160,8 @@ function Get-Quote {
 function Run-Sell {
     param([string]$tokenAmount)
     Write-Host ""
-    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y" -ForegroundColor Cyan
-    speed swap -c $Chain --sell $Token --buy eth -a $tokenAmount -y
+    Write-Host ">>> Executing: speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y" -ForegroundColor Cyan
+    speed swap -c $Chain --sell $Token --buy $BaseToken -a $tokenAmount -y
     exit $LASTEXITCODE
 }
 
@@ -171,17 +173,25 @@ $tokenDecimals = Get-TokenDecimals -tokenAddr $Token -chainName $Chain
 $TOKEN_SCALE   = [Math]::Pow(10, $tokenDecimals)
 $TokenLabel    = if ($TokenSymbol -ne "") { $TokenSymbol } else { $Token }
 
+# v2: configurable base token (default Speed; use ETH when Token is also Speed)
+if ($BaseToken.ToLower() -eq $Token.ToLower()) { $BaseToken = 'eth' }
+$baseDecimals = Get-TokenDecimals -tokenAddr $BaseToken -chainName $Chain
+$script:BASE_DECIMALS_SCALE = [Math]::Pow(10, $baseDecimals)
+$script:BaseLabel = if ($BaseTokenSymbol -ne "") { $BaseTokenSymbol } else { $BaseToken }
+
 if ($WindowPolls -lt 2)      { Write-Error "-WindowPolls must be >= 2."; exit 1 }
 if ($CompressionPct -le 0)   { Write-Error "-CompressionPct must be > 0."; exit 1 }
 if ($TrailPct -le 0)         { Write-Error "-TrailPct must be > 0."; exit 1 }
 if ($ArmTimeout -lt 0)       { Write-Error "-ArmTimeout must be >= 0."; exit 1 }
+if ($ExpansionPct -lt 0)     { Write-Error "-ExpansionPct must be >= 0."; exit 1 }
+if ($ExpansionPct -eq 0)     { Write-Warning "-ExpansionPct 0: any price at or above window high while armed triggers entry." }
 
 Write-Host ""
 Write-Host "=== Speed Compression Buy ===" -ForegroundColor Yellow
 if ($DryRun) { Write-Host "  *** DRY-RUN MODE -- compression signals logged, no buy will execute ***" -ForegroundColor DarkYellow }
 Write-Host "  Chain           : $Chain"
 Write-Host "  Token           : $TokenLabel  (decimals: $tokenDecimals)"
-Write-Host "  Buy amount      : $Amount ETH  (on expansion breakout)"
+Write-Host "  Buy amount      : $Amount $($script:BaseLabel)  (on expansion breakout)"
 Write-Host "  Window polls    : $WindowPolls  (rolling range + mean)"
 Write-Host "  Compression     : <= $CompressionPct % range/mean  (arm condition)"
 Write-Host "  Expansion       : +$ExpansionPct % above window high while armed  (entry)"
@@ -195,9 +205,9 @@ Write-Host ""
 
 # -- step 1: reference quote (no buy yet) --------------------------------------
 
-Write-Host "Step 1 - Quoting $Amount ETH -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
+Write-Host "Step 1 - Quoting $Amount $($script:BaseLabel) -> $TokenLabel (reference, no buy yet)..." -ForegroundColor DarkCyan
 
-$refBuyQuote   = Get-Quote -sellTok 'eth' -buyTok $Token -sellAmt $Amount
+$refBuyQuote   = Get-Quote -sellTok $BaseToken -buyTok $Token -sellAmt $Amount
 $refTokenRaw   = [double]$refBuyQuote.buyAmount
 $refTokenHuman = $refTokenRaw / $TOKEN_SCALE
 $refTokenStr   = $refTokenHuman.ToString("F$tokenDecimals")
@@ -206,18 +216,18 @@ if ([double]$refTokenStr -le 0) {
     Write-Error "Reference token amount resolved to 0. Aborting."
     exit 1
 }
-Write-Host ("  Reference amount : {0} {1} for {2} ETH" -f $refTokenStr, $TokenLabel, $Amount)
+Write-Host ("  Reference amount : {0} {1} for {2} {3}" -f $refTokenStr, $TokenLabel, $Amount, $script:BaseLabel)
 
 # -- step 2: initial price -----------------------------------------------------
 
 Write-Host ""
 Write-Host "Step 2 - Getting initial price..." -ForegroundColor DarkCyan
 
-$initSellQuote = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+$initSellQuote = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
 $initRaw       = [double]$initSellQuote.buyAmount
-$initETH       = $initRaw / $ETH_DECIMALS
+$initETH       = $initRaw / $script:BASE_DECIMALS_SCALE
 
-Write-Host ("  Initial price : {0:F8} ETH  (for {1} {2})" -f $initETH, $refTokenStr, $TokenLabel)
+Write-Host ("  Initial price : {0:F8} {3}  (for {1} {2})" -f $initETH, $refTokenStr, $TokenLabel, $script:BaseLabel)
 Write-Host ""
 
 # -- step 3: warm-up phase -----------------------------------------------------
@@ -237,16 +247,16 @@ while ($warmupDone -lt $warmupNeeded) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $wq      = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $wq      = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $wRaw    = [double]$wq.buyAmount
-        $wETH    = $wRaw / $ETH_DECIMALS
+        $wETH    = $wRaw / $script:BASE_DECIMALS_SCALE
         $wHigh   = ($window | Measure-Object -Maximum).Maximum
         $wLow    = ($window | Measure-Object -Minimum).Minimum
         $wMean   = ($window | Measure-Object -Average).Average
         $wRange  = if ($wMean -gt 0) { (($wHigh - $wLow) / $wMean) * 100.0 } else { 0.0 }
         $ts2     = Get-Date -Format "HH:mm:ss"
-        Write-Host ("[$ts2] Price: {0:F8} ETH  range: {1:F2}%  compress<={2}%  [{3} samples]" -f `
-            $wETH, $wRange, $CompressionPct, ($window.Count + 1)) -ForegroundColor DarkGray
+        Write-Host ("[$ts2] Price: {0:F8} {4}  range: {1:F2}%  compress<={2}%  [{3} samples]" -f `
+            $wETH, $wRange, $CompressionPct, ($window.Count + 1), $script:BaseLabel) -ForegroundColor DarkGray
         $window.Enqueue($wRaw)
         if ($window.Count -gt $WindowPolls) { [void]$window.Dequeue() }
     } catch {
@@ -262,7 +272,7 @@ $wLow     = ($window | Measure-Object -Minimum).Minimum
 $wRange   = if ($wMean -gt 0) { (($wHigh - $wLow) / $wMean) * 100.0 } else { 0.0 }
 
 Write-Host ""
-Write-Host ("Warm-up complete. Range: {0:F2}%  Mean: {1:F8} ETH  ({2} polls)" -f $wRange, ($wMean / $ETH_DECIMALS), $WindowPolls) -ForegroundColor DarkCyan
+Write-Host ("Warm-up complete. Range: {0:F2}%  Mean: {1:F8} {3}  ({2} polls)" -f $wRange, ($wMean / $script:BASE_DECIMALS_SCALE), $WindowPolls, $script:BaseLabel) -ForegroundColor DarkCyan
 Write-Host ""
 
 # -- step 4: monitoring - compression detection + expansion entry --------------
@@ -274,6 +284,7 @@ $iteration   = 0
 $armed       = $false
 $armPollCount= 0
 $entryMade   = $false
+$dryRunExpansionSeen = $false
 $tokenStr    = ""
 $peakRaw     = [double]0
 $floorRaw    = [double]0
@@ -285,9 +296,9 @@ while ($iteration -lt $MaxIterations) {
     Start-Sleep -Seconds $PollSeconds
 
     try {
-        $q          = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+        $q          = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
         $currentRaw = [double]$q.buyAmount
-        $currentETH = $currentRaw / $ETH_DECIMALS
+        $currentETH = $currentRaw / $script:BASE_DECIMALS_SCALE
         $ts2        = Get-Date -Format "HH:mm:ss"
 
         # Update rolling window
@@ -297,21 +308,21 @@ while ($iteration -lt $MaxIterations) {
         $windowHigh   = ($window | Measure-Object -Maximum).Maximum
         $windowLow    = ($window | Measure-Object -Minimum).Minimum
         $rangeRatio   = if ($rollingMean -gt 0) { (($windowHigh - $windowLow) / $rollingMean) * 100.0 } else { 0.0 }
-        $windowHighETH= $windowHigh / $ETH_DECIMALS
+        $windowHighETH= $windowHigh / $script:BASE_DECIMALS_SCALE
 
         # ── post-entry: trailing stop ──────────────────────────────────────────
         if ($entryMade) {
-            $tq   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $tokenStr
+            $tq   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $tokenStr
             $tRaw = [double]$tq.buyAmount
-            $tETH = $tRaw / $ETH_DECIMALS
+            $tETH = $tRaw / $script:BASE_DECIMALS_SCALE
 
             if ($tRaw -gt $peakRaw) {
                 $peakRaw  = $tRaw
                 $floorRaw = $peakRaw * (1.0 - $TrailPct / 100.0)
             }
 
-            $peakETH     = $peakRaw / $ETH_DECIMALS
-            $floorETH    = $floorRaw / $ETH_DECIMALS
+            $peakETH     = $peakRaw / $script:BASE_DECIMALS_SCALE
+            $floorETH    = $floorRaw / $script:BASE_DECIMALS_SCALE
             $pctFromPeak = (($tRaw - $peakRaw) / $peakRaw) * 100.0
 
             $trailDist   = $peakRaw - $floorRaw
@@ -324,13 +335,13 @@ while ($iteration -lt $MaxIterations) {
                 $color = "White"
             }
 
-            Write-Host ("[$ts2] POST-ENTRY  {0:F8} ETH  peak: {1:F8}  floor: {2:F8}  ({3:F4}% from peak)" -f `
-                $tETH, $peakETH, $floorETH, $pctFromPeak) -ForegroundColor $color
+            Write-Host ("[$ts2] POST-ENTRY  {0:F8} {4}  peak: {1:F8} {4}  floor: {2:F8} {4}  ({3:F4}% from peak)" -f `
+                $tETH, $peakETH, $floorETH, $pctFromPeak, $script:BaseLabel) -ForegroundColor $color
 
             if ($tRaw -le $floorRaw) {
                 $gainPct = (($tETH - [double]$Amount) / [double]$Amount) * 100.0
                 Write-Host ""
-                Write-Host ("Trail floor breached! {0:F8} ETH back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct) -ForegroundColor Red
+                Write-Host ("Trail floor breached! {0:F8} {2} back  ({1:F4}% vs entry cost)" -f $tETH, $gainPct, $script:BaseLabel) -ForegroundColor Red
                 Run-Sell $tokenStr
             }
             continue
@@ -343,13 +354,13 @@ while ($iteration -lt $MaxIterations) {
             # Price broke out of compression band without expansion signal — reset
             $armed        = $false
             $armPollCount = 0
-            Write-Host ("[$ts2] COMPRESSION  range: {0:F2}%  mean: {1:F8}  [COMPRESSION LOST - range expanded beyond {2}%]" -f `
-                $rangeRatio, ($rollingMean / $ETH_DECIMALS), $CompressionPct) -ForegroundColor DarkGray
+            Write-Host ("[$ts2] COMPRESSION  range: {0:F2}%  mean: {1:F8} {3}  [COMPRESSION LOST - range expanded beyond {2}%]" -f `
+                $rangeRatio, ($rollingMean / $script:BASE_DECIMALS_SCALE), $CompressionPct, $script:BaseLabel) -ForegroundColor DarkGray
         } elseif (-not $armed -and $isCompressed) {
             $armed        = $true
             $armPollCount = 0
-            Write-Host ("[$ts2] COMPRESSION  range: {0:F2}% <= {1}%  mean: {1:F8} -- ARMED" -f `
-                $rangeRatio, $CompressionPct, ($rollingMean / $ETH_DECIMALS)) -ForegroundColor Cyan
+            Write-Host ("[$ts2] COMPRESSION  range: {0:F2}% <= {1}%  mean: {2:F8} {3} -- ARMED" -f `
+                $rangeRatio, $CompressionPct, ($rollingMean / $script:BASE_DECIMALS_SCALE), $script:BaseLabel) -ForegroundColor Cyan
         } elseif ($armed) {
             $armPollCount++
             # Check ArmTimeout
@@ -363,7 +374,7 @@ while ($iteration -lt $MaxIterations) {
 
         # ── expansion breakout check (only when armed) ─────────────────────────
         $expansionThresh    = $windowHigh * (1.0 + $ExpansionPct / 100.0)
-        $expansionThreshETH = $expansionThresh / $ETH_DECIMALS
+        $expansionThreshETH = $expansionThresh / $script:BASE_DECIMALS_SCALE
         $pctVsHigh          = (($currentRaw - $windowHigh) / $windowHigh) * 100.0
 
         $armedLabel = if ($armed) { "ARMED" } else { "watching" }
@@ -373,39 +384,43 @@ while ($iteration -lt $MaxIterations) {
             $color = if ($isCompressed) { "Cyan" } else { "DarkGray" }
         }
 
-        Write-Host ("[$ts2] [{5}] price: {0:F8}  win-high: {1:F8}  range: {2:F2}%  exp-thresh: {3:F8}  ({4:+0.4f}% vs high)" -f `
-            $currentETH, $windowHighETH, $rangeRatio, $expansionThreshETH, $pctVsHigh, $armedLabel) -ForegroundColor $color
+        Write-Host ("[$ts2] [{6}] price: {0:F8} {5}  win-high: {1:F8} {5}  range: {2:F2}%  exp-thresh: {3:F8} {5}  ({4:F4}% vs high)" -f `
+            $currentETH, $windowHighETH, $rangeRatio, $expansionThreshETH, $pctVsHigh, $script:BaseLabel, $armedLabel) -ForegroundColor $color
 
         if ($armed -and $currentRaw -ge $expansionThresh) {
             Write-Host ""
-            Write-Host ("EXPANSION BREAKOUT! Price {0:F8} ETH >= {1:F8} ETH while compressed  (+{2:F4}% vs window high)" -f `
-                $currentETH, $expansionThreshETH, $pctVsHigh) -ForegroundColor Green
+            Write-Host ("EXPANSION BREAKOUT! Price {0:F8} {3} >= {1:F8} {3} while compressed  (+{2:F4}% vs window high)" -f `
+                $currentETH, $expansionThreshETH, $pctVsHigh, $script:BaseLabel) -ForegroundColor Green
 
             if ($DryRun) {
-                Write-Host "  [DRY-RUN] Would BUY $Amount ETH of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                Write-Host "  [DRY-RUN] Would BUY $Amount $($script:BaseLabel) of $TokenLabel now. Continuing to observe..." -ForegroundColor DarkYellow
+                $dryRunExpansionSeen = $true
                 $armed = $false
             } else {
                 Write-Host ""
-                Write-Host "Executing compression breakout buy: $Amount ETH -> $TokenLabel" -ForegroundColor Green
-                Write-Host ">>> speed swap -c $Chain --sell eth --buy $Token -a $Amount -y" -ForegroundColor Cyan
-                speed swap -c $Chain --sell eth --buy $Token -a $Amount -y
+                Write-Host "Executing compression breakout buy: $Amount $($script:BaseLabel) -> $TokenLabel" -ForegroundColor Green
+                Write-Host ">>> speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y" -ForegroundColor Cyan
+                speed swap -c $Chain --sell $BaseToken --buy $Token -a $Amount -y
                 if ($LASTEXITCODE -ne 0) {
                     Write-Error "Compression buy failed (exit $LASTEXITCODE). Aborting."
                     exit $LASTEXITCODE
                 }
+                $actTokenRaw = $refTokenRaw
+                $actTokenHuman = $actTokenRaw / $TOKEN_SCALE
+                $refTokenStr   = $actTokenHuman.ToString("F$tokenDecimals")
                 Write-Host ""
 
                 Write-Host "Getting post-buy sell quote to anchor trailing stop..." -ForegroundColor DarkCyan
-                $postBuyQ   = Get-Quote -sellTok $Token -buyTok 'eth' -sellAmt $refTokenStr
+                $postBuyQ   = Get-Quote -sellTok $Token -buyTok $BaseToken -sellAmt $refTokenStr
                 $postBuyRaw = [double]$postBuyQ.buyAmount
                 $tokenStr   = $refTokenStr
                 $peakRaw    = $postBuyRaw
                 $floorRaw   = $peakRaw * (1.0 - $TrailPct / 100.0)
                 $entryMade  = $true
 
-                Write-Host ("  Entry price  : {0:F8} ETH  (for {1} {2})" -f ($postBuyRaw / $ETH_DECIMALS), $tokenStr, $TokenLabel) -ForegroundColor DarkGray
-                Write-Host ("  Trail peak   : {0:F8} ETH" -f ($peakRaw / $ETH_DECIMALS)) -ForegroundColor DarkGray
-                Write-Host ("  Trail floor  : {0:F8} ETH  (-{1}%)" -f ($floorRaw / $ETH_DECIMALS), $TrailPct) -ForegroundColor DarkGray
+                Write-Host ("  Entry price  : {0:F8} {3}  (for {1} {2})" -f ($postBuyRaw / $script:BASE_DECIMALS_SCALE), $tokenStr, $TokenLabel, $script:BaseLabel) -ForegroundColor DarkGray
+                Write-Host ("  Trail peak   : {0:F8} {1}" -f ($peakRaw / $script:BASE_DECIMALS_SCALE), $script:BaseLabel) -ForegroundColor DarkGray
+                Write-Host ("  Trail floor  : {0:F8} {2}  (-{1}%)" -f ($floorRaw / $script:BASE_DECIMALS_SCALE), $TrailPct, $script:BaseLabel) -ForegroundColor DarkGray
                 Write-Host ""
             }
         }
@@ -421,6 +436,9 @@ Write-Host ""
 if ($entryMade) {
     Write-Host "Max iterations ($MaxIterations) reached. Selling position..." -ForegroundColor Yellow
     Run-Sell $tokenStr
+} elseif ($DryRun -and $dryRunExpansionSeen) {
+    Write-Host "Max iterations ($MaxIterations) reached. Dry-run logged expansion signal(s); no on-chain trade." -ForegroundColor Yellow
+    exit 0
 } else {
     Write-Host "Max iterations ($MaxIterations) reached. No expansion breakout detected. Exiting without a trade." -ForegroundColor Yellow
     exit 0
